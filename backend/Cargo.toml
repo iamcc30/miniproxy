@@ -1,0 +1,28 @@
+[package]
+name = "miniproxy"
+version = "0.1.0"
+edition = "2021"
+description = "MiniProxy - a MITM debugging proxy with HTTP/HTTPS/WebSocket/TCP capture"
+
+[[bin]]
+name = "miniproxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+hyper-rustls = { version = "0.24", features = ["http1", "native-tokio", "tls12"] }
+rustls = "0.21"
+tokio-rustls = "0.24"
+rustls-native-certs = "0.6"
+rcgen = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "deflate", "brotli", "zstd"] }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+base64 = "0.22"
+percent-encoding = "2"
+
+[profile.dev]
+opt-level = 1
