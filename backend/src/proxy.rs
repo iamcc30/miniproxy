@@ -9,7 +9,7 @@ use hyper::{Body, Method, Request, Response};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::capture::{self, Entry, Store};
+use crate::capture::{self, ClientInfo, Entry, Store};
 use crate::dial;
 use crate::peek::Peeked;
 use crate::util;
@@ -20,7 +20,7 @@ use crate::App;
 pub async fn handle_proxy(
     req: Request<Body>,
     app: Arc<App>,
-    client: Option<String>,
+    client: ClientInfo,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     if req.method() == Method::CONNECT {
         let authority = req.uri().to_string();
@@ -54,7 +54,7 @@ async fn handle_tunnel(
     io: hyper::upgrade::Upgraded,
     authority: String,
     app: Arc<App>,
-    client: Option<String>,
+    client: ClientInfo,
 ) {
     let mut peeked = Peeked::new(io);
     let mut first = [0u8; 1];
@@ -68,36 +68,65 @@ async fn handle_tunnel(
     // 关键：把探测用的首字节放回流中，否则 ClientHello 会缺失首字节
     peeked.peeked = Some(first[0]);
 
-    if first[0] == 0x16 && mitm_allowed(&host) {
-        // TLS 握手 -> MITM
-        let acceptor = tokio_rustls::TlsAcceptor::from(app.ca.server_config_for(&host));
-        if let Ok(tls_stream) = acceptor.accept(peeked).await {
-            let svc = service_fn(move |req| {
-                handle_inner(req, host.clone(), app.clone(), client.clone())
-            });
-            let _ = Http::new()
-                .serve_connection(tls_stream, svc)
-                .with_upgrades()
-                .await;
-            return;
+    if first[0] == 0x16 {
+        // TLS 握手 -> 按判定结果 MITM 或直通
+        match mitm_decision(&app, &host) {
+            MitmDecision::Allow => {
+                let acceptor = tokio_rustls::TlsAcceptor::from(app.ca.server_config_for(&host));
+                if let Ok(tls_stream) = acceptor.accept(peeked).await {
+                    app.clear_tls_failure(&host);
+                    let svc = service_fn(move |req| {
+                        handle_inner(req, host.clone(), app.clone(), client.clone())
+                    });
+                    let _ = Http::new()
+                        .serve_connection(tls_stream, svc)
+                        .with_upgrades()
+                        .await;
+                    return;
+                }
+                // TLS 握手失败：无法恢复原始流。记录并计数，达到阈值后该域名自动直通
+                let auto = app.record_tls_failure(&host);
+                let entry = app.store.new_entry(
+                    "tcp",
+                    "TUNNEL",
+                    &format!("tcp://{}:{}", host, port),
+                    &host,
+                    vec![("Authority".into(), authority.clone())],
+                    client,
+                );
+                let msg = if auto {
+                    format!("TLS 握手失败（客户端证书固定，{} 已自动直通，后续连接不再解密）", host)
+                } else {
+                    "TLS 握手失败（客户端拒绝 MITM 证书或提前断开）".to_string()
+                };
+                finish_err(&entry, &app.store, msg);
+            }
+            bypass => {
+                // TLS 直通：纯 TCP 隧道记录（客户端照常与真实证书握手，不影响其使用）
+                let note = match bypass {
+                    MitmDecision::BypassAuto => "TLS 直通（客户端证书固定，自动跳过）",
+                    _ => "TLS 直通（MITM 白名单）",
+                };
+                let entry = app.store.new_entry(
+                    "tcp",
+                    "TUNNEL",
+                    &format!("tcp://{}:{}", host, port),
+                    &host,
+                    vec![
+                        ("Authority".into(), authority.clone()),
+                        ("Mode".into(), note.into()),
+                    ],
+                    client,
+                );
+                app.store.push(entry.clone());
+                match dial::tcp_dial(app.upstream.as_ref(), host.as_str(), port).await {
+                    Ok(remote) => crate::tcp::splice_tcp(peeked, remote, entry).await,
+                    Err(e) => finish_err(&entry, &app.store, format!("连接目标失败: {}", e)),
+                }
+            }
         }
-        // TLS 握手失败：无法恢复原始流，仅记录
-        let entry = app.store.new_entry(
-            "tcp",
-            "TUNNEL",
-            &format!("tcp://{}:{}", host, port),
-            &host,
-            vec![("Authority".into(), authority.clone())],
-            client,
-        );
-        finish_err(&entry, &app.store, "TLS 握手失败（客户端拒绝 MITM 证书或提前断开）".into());
     } else {
-        // 非 TLS，或 TLS 但命中 MITM 白名单：纯 TCP 隧道记录
-        let note = if first[0] == 0x16 {
-            "TLS 直通（MITM 白名单）"
-        } else {
-            "TCP"
-        };
+        // 非 TLS：纯 TCP 隧道记录
         let entry = app.store.new_entry(
             "tcp",
             "TUNNEL",
@@ -105,7 +134,7 @@ async fn handle_tunnel(
             &host,
             vec![
                 ("Authority".into(), authority.clone()),
-                ("Mode".into(), note.into()),
+                ("Mode".into(), "TCP".into()),
             ],
             client,
         );
@@ -117,11 +146,28 @@ async fn handle_tunnel(
     }
 }
 
+/// TLS 握手失败自动直通的阈值：同一域名失败达到该次数后不再 MITM。
+/// 任意一次握手成功都会清零计数，避免偶发中断被误判为证书固定。
+pub const AUTO_BYPASS_THRESHOLD: u32 = 3;
+
+#[derive(PartialEq)]
+pub enum MitmDecision {
+    /// 允许 MITM 解密
+    Allow,
+    /// 静态白名单直通（Apple 系统服务 / MINIPROXY_NO_MITM）
+    BypassStatic,
+    /// 动态直通：客户端证书固定，握手失败次数达到阈值
+    BypassAuto,
+}
+
 /// 判断目标 host 是否允许 MITM 解密。
 ///
-/// 默认放行（不解密）Apple/iCloud 等已知证书固定或不信任用户 CA 的系统服务域名；
-/// 可用 `MINIPROXY_NO_MITM=a.com,b.org` 追加白名单后缀。
-fn mitm_allowed(host: &str) -> bool {
+/// 三层判定：
+/// 1. 静态白名单：Apple/iCloud 等已知证书固定或不信任用户 CA 的系统服务域名；
+/// 2. `MINIPROXY_NO_MITM=a.com,b.org` 追加白名单后缀；
+/// 3. 动态自动直通：同一域名 TLS 握手失败达 `AUTO_BYPASS_THRESHOLD` 次后自动跳过 MITM，
+///    让证书固定（pinning）的 App（微博、穿山甲广告 SDK 等）在代理下照常工作。
+fn mitm_decision(app: &App, host: &str) -> MitmDecision {
     const DEFAULT_BYPASS: &[&str] = &[
         "icloud.com",
         "icloud.com.cn",
@@ -141,7 +187,15 @@ fn mitm_allowed(host: &str) -> bool {
         .map(|s| s.to_string())
         .chain(extra)
         .any(|suffix| host == suffix || host.ends_with(&format!(".{}", suffix)));
-    !bypassed
+    if bypassed {
+        return MitmDecision::BypassStatic;
+    }
+    if let Ok(m) = app.bypass_counts.lock() {
+        if m.get(&host).copied().unwrap_or(0) >= AUTO_BYPASS_THRESHOLD {
+            return MitmDecision::BypassAuto;
+        }
+    }
+    MitmDecision::Allow
 }
 
 /// MITM 内层 HTTP 处理：普通请求捕获转发，WebSocket 升级走专用路径。
@@ -149,7 +203,7 @@ async fn handle_inner(
     req: Request<Body>,
     host: String,
     app: Arc<App>,
-    client: Option<String>,
+    client: ClientInfo,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     if util::is_upgrade_request(req.method(), req.headers()) {
         return Ok(handle_ws_upgrade(req, app, Some(host), client).await);
@@ -164,7 +218,7 @@ pub async fn handle_ws_upgrade(
     req: Request<Body>,
     app: Arc<App>,
     inner_authority: Option<String>,
-    client: Option<String>,
+    client: ClientInfo,
 ) -> Response<Body> {
     let method = req.method().clone();
     let uri = req.uri().clone();

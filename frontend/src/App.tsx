@@ -13,12 +13,16 @@ import {
   RESOURCE_OPTIONS,
   STATUS_OPTIONS,
   SysProxyStatus,
+  RawView,
+  b64ToBytes,
   clearEntries,
+  downloadBytes,
   emptyFacets,
   emptyFilters,
   fetchDetail,
   fetchEntries,
   fetchFacets,
+  fetchInfo,
   fetchSysProxy,
   filtersToQuery,
   formatBytes,
@@ -28,12 +32,17 @@ import {
   groupKeyToFilter,
   groupLabelOf,
   hasAnyFilter,
+  looksBinary,
   optionLabel,
   resourceMeta,
   setSysProxy,
   statusColor,
+  suggestFilename,
+  toHexDump,
   tryPrettyJson,
+  wrapBase64,
 } from './api';
+import { QRCodeSVG } from 'qrcode.react';
 import { applyTheme, getStoredTheme, watchSystemTheme, Theme } from './theme';
 
 /* ---------------- 主题切换 ---------------- */
@@ -237,6 +246,8 @@ export default function App() {
   const [tab, setTab] = useState<'req' | 'res' | 'ws' | 'raw'>('req');
   const [sysProxy, setSysProxyState] = useState<SysProxyStatus | null>(null);
   const [sysBusy, setSysBusy] = useState(false);
+  const [info, setInfo] = useState<Awaited<ReturnType<typeof fetchInfo>> | null>(null);
+  const [lanDismissed, setLanDismissed] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
@@ -388,10 +399,20 @@ export default function App() {
     fetchSysProxy().then(setSysProxyState).catch(() => {});
   }, []);
   useEffect(() => {
+    fetchInfo().then(setInfo).catch(() => {});
     refreshSysProxy();
     const t = setInterval(refreshSysProxy, 5000);
     return () => clearInterval(t);
   }, [refreshSysProxy]);
+
+  // 局域网设备（手机抓包）提示：任一条目来自非本机 IP 即显示
+  const lanDeviceIp = useMemo(() => {
+    for (const e of entries) {
+      const ip = e.clientIp;
+      if (ip && ip !== '127.0.0.1' && ip !== '::1') return ip;
+    }
+    return null;
+  }, [entries]);
 
   const toggleSysProxy = useCallback(async () => {
     if (!sysProxy?.supported || sysBusy) return;
@@ -646,6 +667,52 @@ export default function App() {
         </div>
       )}
 
+      {lanDeviceIp && !lanDismissed && (
+        <div className="lan-banner">
+          <div className="lan-text">
+            <div className="lan-title">📱 检测到局域网设备 {lanDeviceIp} 正在使用代理</div>
+            <div className="lan-steps">
+              TLS 握手失败是因为该设备尚未信任 MiniProxy CA 证书。安装步骤：
+              <ol>
+                <li>
+                  手机浏览器打开{' '}
+                  <code>{info && !info.caUrl.startsWith('/') ? info.caUrl : `http://${lanDeviceIp.split('.').slice(0, 3).join('.')}.x:${info?.apiPort ?? 9000}/api/ca.crt`}</code>{' '}
+                  下载证书
+                  <button
+                    type="button"
+                    className="lan-copy"
+                    onClick={() => {
+                      if (info && !info.caUrl.startsWith('/')) navigator.clipboard?.writeText(info.caUrl);
+                    }}
+                    title="复制证书下载地址"
+                  >
+                    复制地址
+                  </button>
+                </li>
+                <li>
+                  <b>iOS</b>：设置 → 通用 → VPN与设备管理 → 安装描述文件，再到「设置 → 通用 →
+                  关于本机 → <b>证书信任设置</b>」开启完全信任（关键，漏掉这步仍会握手失败）
+                </li>
+                <li>
+                  <b>Android</b>：设置 → 安全 → 更多安全设置 → 加密与凭据 → 安装 CA 证书
+                  （安卓 7+ 多数 App 默认不信任用户证书，仅浏览器等可用）
+                </li>
+                <li>个别 App 有证书固定（pinning），装了证书也无法解密，属正常现象</li>
+              </ol>
+            </div>
+          </div>
+          {info && !info.caUrl.startsWith('/') && (
+            <div className="lan-qr" title="手机扫码打开证书下载页">
+              <QRCodeSVG value={info.caUrl} size={72} />
+              <span>扫码下载证书</span>
+            </div>
+          )}
+          <button type="button" className="lan-close" title="不再提示" onClick={() => setLanDismissed(true)}>
+            ×
+          </button>
+        </div>
+      )}
+
       <div className="main">
         <section className="list-pane">
           <div className="list-meta">
@@ -810,30 +877,124 @@ function HeadersTable({ headers }: { headers: [string, string][] }) {
   );
 }
 
+type BodyViewMode = 'text' | 'hex' | 'base64';
+
+/**
+ * 正文查看器：文本 / 十六进制 / Base64 三种视图，支持复制与下载原始字节。
+ * 二进制或压缩内容在文本视图里会显示为乱码，此时自动切到十六进制并给出提示。
+ */
 function BodyView({
   text,
+  raw,
   decoded,
   truncated,
   label,
+  url,
 }: {
   text: string | null;
+  /** 与 text 对应的原始字节（base64），用于十六进制 / Base64 / 下载 */
+  raw: RawView | null;
   decoded: string | null;
   truncated: boolean;
   label?: string;
+  /** 用于推导下载文件名 */
+  url?: string;
 }) {
-  const pretty = tryPrettyJson(text);
-  const shown = pretty ?? text ?? '';
+  const bytes = useMemo(() => (raw ? b64ToBytes(raw.b64) : new Uint8Array(0)), [raw]);
+  const binary = looksBinary(text);
+  const [mode, setMode] = useState<BodyViewMode>('text');
+  const [copied, setCopied] = useState(false);
+
+  // 切换到另一条记录时，依据内容类型重置默认视图
+  useEffect(() => {
+    setMode(looksBinary(text) ? 'hex' : 'text');
+    setCopied(false);
+  }, [text]);
+
+  const pretty = mode === 'text' ? tryPrettyJson(text) : null;
+  const shown =
+    mode === 'text'
+      ? (pretty ?? text ?? '')
+      : mode === 'hex'
+        ? toHexDump(bytes)
+        : wrapBase64(raw?.b64 ?? '');
+
+  const hasBody = !!text || bytes.length > 0;
+  const downloadable = bytes.length > 0;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(shown);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  };
+
   return (
     <>
-      {label && <div className="sub-title">{label}</div>}
-      {(decoded || truncated) && (
+      <div className="body-toolbar">
+        {label && <span className="sub-title" style={{ margin: 0 }}>{label}</span>}
+        <div className="view-switch" role="group" aria-label="正文视图">
+          {(
+            [
+              ['text', '文本'],
+              ['hex', '十六进制'],
+              ['base64', 'Base64'],
+            ] as [BodyViewMode, string][]
+          ).map(([m, l]) => (
+            <button
+              key={m}
+              type="button"
+              className={mode === m ? 'active' : ''}
+              disabled={m !== 'text' && !raw}
+              onClick={() => setMode(m)}
+            >
+              {l}
+            </button>
+          ))}
+        </div>
+        <div className="body-actions">
+          {raw && (
+            <span className="raw-size" title="原始字节数">
+              {formatBytes(raw.size)}
+              {raw.truncated && ' · 视图已截断'}
+            </span>
+          )}
+          <button type="button" onClick={copy} disabled={!hasBody}>
+            {copied ? '已复制' : '复制'}
+          </button>
+          <button
+            type="button"
+            disabled={!downloadable}
+            title="下载原始字节"
+            onClick={() => downloadBytes(bytes, suggestFilename(url ?? ''))}
+          >
+            下载原始数据
+          </button>
+        </div>
+      </div>
+      {(decoded || truncated || binary) && (
         <div style={{ marginBottom: 8 }}>
           {decoded && <span className="badge decode">已解压：{decoded}</span>}
           {truncated && <span className="badge warn">内容过大，已截断</span>}
           {pretty && <span className="badge">JSON 已格式化</span>}
+          {binary && (
+            <span className="badge warn">
+              内容非文本（二进制 / 压缩），已默认显示原始字节
+            </span>
+          )}
+          {mode !== 'text' && (
+            <span className="badge">{mode === 'hex' ? '十六进制视图' : 'Base64 视图'}</span>
+          )}
         </div>
       )}
-      {text ? <pre className="body-view">{shown}</pre> : <div className="sub-title">（空）</div>}
+      {hasBody ? (
+        <pre className={`body-view${mode === 'hex' ? ' hex-view' : ''}`}>{shown}</pre>
+      ) : (
+        <div className="sub-title">（空）</div>
+      )}
     </>
   );
 }
@@ -884,7 +1045,16 @@ function Detail({
           <>
             <div className="sub-title">请求头</div>
             <HeadersTable headers={detail.reqHeaders} />
-            {kind === 'http' && <BodyView text={detail.reqBody} decoded={null} truncated={detail.reqTruncated} label="请求体" />}
+            {kind === 'http' && (
+              <BodyView
+                text={detail.reqBody}
+                raw={detail.reqBodyRaw}
+                decoded={null}
+                truncated={detail.reqTruncated}
+                label="请求体"
+                url={detail.url}
+              />
+            )}
           </>
         )}
         {tab === 'res' && (
@@ -893,9 +1063,11 @@ function Detail({
             <HeadersTable headers={detail.respHeaders ?? []} />
             <BodyView
               text={detail.respDecoded ?? detail.respBody}
+              raw={detail.respDecodedRaw ?? detail.respBodyRaw}
               decoded={detail.decoded}
               truncated={detail.respTruncated}
               label={detail.decoded ? `响应体（已从 ${detail.decoded} 解压）` : '响应体'}
+              url={detail.url}
             />
           </>
         )}
@@ -921,6 +1093,12 @@ function Detail({
         )}
         {tab === 'raw' && (
           <>
+            {kind === 'tcp' && detail.reqHeaders.length > 0 && (
+              <>
+                <div className="sub-title">连接信息</div>
+                <HeadersTable headers={detail.reqHeaders} />
+              </>
+            )}
             <div className="sub-title">首包十六进制预览</div>
             <pre className="body-view hex-view">{detail.tcpHex ?? '（无数据）'}</pre>
             <div className="sub-title">流量统计</div>

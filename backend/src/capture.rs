@@ -17,6 +17,32 @@ pub const BODY_CAP: usize = 4 * 1024 * 1024;
 /// 参与关键词搜索的单侧正文上限（请求体 / 响应体各自）。避免超大响应把内存和单次匹配拖垮。
 pub const SEARCH_BODY_CAP: usize = 128 * 1024;
 
+/// 详情接口附带「原始数据」视图（hex / base64 / 下载）的单侧上限：
+/// 超出只回传前 N 字节并置 truncated（原始大小仍在 size 字段里）。
+pub const RAW_VIEW_CAP: usize = 256 * 1024;
+
+/// 原始字节视图：`{ b64, size, truncated }`，无正文时为 null。
+/// 前端据此渲染十六进制 / Base64 / 下载，解决二进制或压缩内容在文本视图里显示为乱码的问题。
+fn raw_json(b: &Option<Vec<u8>>) -> serde_json::Value {
+    use base64::Engine as _;
+    match b {
+        None => serde_json::Value::Null,
+        Some(bytes) => {
+            let truncated = bytes.len() > RAW_VIEW_CAP;
+            let slice = if truncated {
+                &bytes[..RAW_VIEW_CAP]
+            } else {
+                &bytes[..]
+            };
+            serde_json::json!({
+                "b64": base64::engine::general_purpose::STANDARD.encode(slice),
+                "size": bytes.len(),
+                "truncated": truncated,
+            })
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct WsMessage {
     pub dir: &'static str,     // c2s / s2c
@@ -24,6 +50,19 @@ pub struct WsMessage {
     pub size: usize,
     pub data: Option<String>,  // 文本内容（截断至 4KB）
     pub ts: u128,
+}
+
+/// 连接来源：客户端进程名（仅本机可识别）+ 对端 IP。
+#[derive(Clone, Default)]
+pub struct ClientInfo {
+    pub name: Option<String>,
+    pub ip: String,
+}
+
+impl ClientInfo {
+    pub fn is_local(&self) -> bool {
+        matches!(self.ip.as_str(), "127.0.0.1" | "::1" | "")
+    }
 }
 
 pub struct EntryInner {
@@ -81,6 +120,8 @@ pub struct Entry {
     pub site: String,
     /// 发起请求的客户端进程名（用于「按应用分组/筛选」）
     pub client: Option<String>,
+    /// 对端 IP（识别局域网设备，如手机抓包）
+    pub client_ip: String,
     pub req_headers: Vec<(String, String)>,
     pub inner: Mutex<EntryInner>,
 }
@@ -110,9 +151,10 @@ impl Store {
         url: &str,
         host: &str,
         req_headers: Vec<(String, String)>,
-        client: Option<String>,
+        client: ClientInfo,
     ) -> Arc<Entry> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let ClientInfo { name, ip } = client;
         Arc::new(Entry {
             id,
             ts: now_ms(),
@@ -121,7 +163,8 @@ impl Store {
             url: url.to_string(),
             host: host.to_string(),
             site: crate::attrib::site_of(host),
-            client,
+            client: name,
+            client_ip: ip,
             req_headers,
             inner: Mutex::new(EntryInner {
                 resp_status: None,
@@ -192,6 +235,7 @@ pub fn summary_json(e: &Entry) -> serde_json::Value {
         "host": e.host,
         "site": e.site,
         "client": e.client,
+        "clientIp": e.client_ip,
         "status": inner.resp_status,
         "contentType": inner.content_type,
         "encoding": inner.content_encoding,
@@ -225,11 +269,14 @@ pub fn detail_json(e: &Entry) -> serde_json::Value {
         "client": e.client,
         "reqHeaders": e.req_headers,
         "reqBody": body_text(&inner.req_body),
+        "reqBodyRaw": raw_json(&inner.req_body),
         "reqTruncated": inner.req_truncated,
         "status": inner.resp_status,
         "respHeaders": inner.resp_headers,
         "respBody": body_text(&inner.resp_body),
+        "respBodyRaw": raw_json(&inner.resp_body),
         "respDecoded": body_text(&inner.resp_decoded),
+        "respDecodedRaw": raw_json(&inner.resp_decoded),
         "decoded": inner.content_encoding,
         "contentType": inner.content_type,
         "respTruncated": inner.resp_truncated,
@@ -621,7 +668,7 @@ pub async fn capture_and_forward(
     req: Request<Body>,
     app: Arc<App>,
     inner_authority: Option<String>,
-    client: Option<String>,
+    client: ClientInfo,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
 

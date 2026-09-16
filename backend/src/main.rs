@@ -35,7 +35,92 @@ pub struct App {
     pub ca: Arc<ca::Ca>,
     pub client: HttpClient,
     pub proxy_port: u16,
+    pub api_port: u16,
+    pub lan_ip: Option<String>,
     pub upstream: Option<dial::Upstream>,
+    /// 各域名 TLS 握手失败计数：达到阈值（proxy::AUTO_BYPASS_THRESHOLD）后自动直通，
+    /// 让证书固定（pinning）的 App 在代理下照常工作。
+    pub bypass_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+}
+
+impl App {
+    /// 记录某域名一次 TLS 握手失败；达到阈值返回 true（此后该域名自动直通）。
+    pub fn record_tls_failure(&self, host: &str) -> bool {
+        let mut m = self.bypass_counts.lock().unwrap();
+        let c = m.entry(host.to_lowercase()).or_insert(0);
+        *c += 1;
+        *c >= proxy::AUTO_BYPASS_THRESHOLD
+    }
+
+    /// 该域名握手成功：清零失败计数，避免偶发中断被误判为「证书固定」。
+    pub fn clear_tls_failure(&self, host: &str) {
+        let mut m = self.bypass_counts.lock().unwrap();
+        m.remove(&host.to_lowercase());
+    }
+}
+
+/// 探测本机局域网 IP：解析 `ifconfig` 输出里的私网地址。
+/// 排除回环 / 链路本地 / Clash TUN 的 fake-IP 网段（198.18.0.0/15）/ 运营商 CGNAT（100.64/10），
+/// 优先 192.168.*，其次 10.*，再次 172.16-31.*；失败时回退到路由表探测。
+fn detect_lan_ip() -> Option<String> {
+    use std::process::Command;
+
+    let priority = |ip: &str| -> Option<u8> {
+        if ip.starts_with("192.168.") {
+            Some(3)
+        } else if ip.starts_with("10.") {
+            Some(2)
+        } else if let Some(rest) = ip.strip_prefix("172.") {
+            let second: u8 = rest.split('.').next()?.parse().ok()?;
+            if (16..=31).contains(&second) {
+                Some(1)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let excluded = |ip: &str| -> bool {
+        ip.starts_with("127.")
+            || ip.starts_with("169.254.")
+            || ip.starts_with("198.18.")
+            || ip.starts_with("198.19.")
+            || ip.starts_with("100.64.")
+    };
+
+    if let Ok(out) = Command::new("ifconfig").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut best: Option<(u8, String)> = None;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("inet ") {
+                let ip = rest.split_whitespace().next().unwrap_or("");
+                if excluded(ip) {
+                    continue;
+                }
+                if let Some(p) = priority(ip) {
+                    if best.as_ref().map(|(bp, _)| p > *bp).unwrap_or(true) {
+                        best = Some((p, ip.to_string()));
+                    }
+                }
+            }
+        }
+        if let Some((_, ip)) = best {
+            return Some(ip);
+        }
+    }
+
+    // 回退：路由表探测（不发实际数据包）
+    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if s.connect("8.8.8.8:80").is_ok() {
+            let ip = s.local_addr().ok()?.ip().to_string();
+            if !ip.starts_with("127.") && !excluded(&ip) {
+                return Some(ip);
+            }
+        }
+    }
+    None
 }
 
 fn env_or(name: &str, default: u16) -> u16 {
@@ -47,9 +132,19 @@ fn env_or(name: &str, default: u16) -> u16 {
 
 #[tokio::main]
 async fn main() {
+    // 看门狗模式：作为独立子进程运行，探测父进程消失后恢复系统代理。
+    // 必须在任何初始化（CA、端口绑定）之前拦截。
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--sysproxy-watchdog" {
+        sysproxy::watchdog_run(&args[2]);
+        return;
+    }
+
     let proxy_port = env_or("MINIPROXY_PORT", 34567);
     let api_port = env_or("MINIPROXY_API_PORT", 9000);
+    let api_host = std::env::var("MINIPROXY_API_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let upstream = dial::Upstream::from_env();
+    let lan_ip = detect_lan_ip();
 
     let store = Arc::new(Store::new(5000));
     let ca = Arc::new(ca::Ca::load_or_create().expect("初始化本地 CA 失败"));
@@ -59,8 +154,13 @@ async fn main() {
     println!("  MiniProxy 抓包代理");
     println!("==============================================");
     println!("  代理端口      : 0.0.0.0:{}  (HTTP/HTTPS/WS)", proxy_port);
-    println!("  界面 & API    : http://127.0.0.1:{}", api_port);
+    println!("  界面 & API    : http://{}:{}", api_host, api_port);
     println!("  CA 证书       : {}", ca.cert_path.display());
+    if api_host != "127.0.0.1" {
+        if let Some(ip) = &lan_ip {
+            println!("  手机抓包      : 代理 {}:{}，CA 证书 http://{}:{}/api/ca.crt", ip, proxy_port, ip, api_port);
+        }
+    }
     println!("                  (浏览器/系统需信任该证书才能解密 HTTPS)");
     match &upstream {
         Some(up) => println!("  上游级联      : {}:{}  (出站流量经此代理转发)", up.host, up.port),
@@ -73,13 +173,26 @@ async fn main() {
         ca,
         client,
         proxy_port,
+        api_port,
+        lan_ip,
         upstream,
+        bypass_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // API + 静态界面服务
     {
         let app = app.clone();
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], api_port));
+        let ip = if api_host == "0.0.0.0" || api_host.is_empty() {
+            [0, 0, 0, 0]
+        } else {
+            api_host
+                .split('.')
+                .filter_map(|p| p.parse::<u8>().ok())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or([127, 0, 0, 1])
+        };
+        let addr = std::net::SocketAddr::from((ip, api_port));
         let make_svc = hyper::service::make_service_fn(move |_conn| {
             let app = app.clone();
             async move {
@@ -96,28 +209,60 @@ async fn main() {
         });
     }
 
-    // 代理服务
+    // 代理服务（放入后台任务，主任务等待退出信号）
     let app2 = app.clone();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], proxy_port));
     let make_svc = hyper::service::make_service_fn(move |conn: &AddrStream| {
         let app = app2.clone();
-        // 客户端本地端口 -> 反查所属进程，用于「按应用分组/筛选」
+        let peer_ip = conn.remote_addr().ip().to_string();
+        // 仅本机连接反查进程（远端设备的端口在 lsof 里查不到，跳过省时）
+        let local = matches!(peer_ip.as_str(), "127.0.0.1" | "::1");
         let peer_port = conn.remote_addr().port();
         async move {
-            let client = tokio::task::spawn_blocking(move || attrib::process_for_port(peer_port))
-                .await
-                .ok()
-                .flatten();
+            let name = if local {
+                tokio::task::spawn_blocking(move || attrib::process_for_port(peer_port))
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let info = capture::ClientInfo { name, ip: peer_ip };
             Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |req| {
-                proxy::handle_proxy(req, app.clone(), client.clone())
+                proxy::handle_proxy(req, app.clone(), info.clone())
             }))
         }
     });
 
-    if let Err(e) = hyper::Server::bind(&addr).serve(make_svc).await {
-        eprintln!("代理服务启动失败: {}", e);
-        std::process::exit(1);
+    {
+        tokio::spawn(async move {
+            if let Err(e) = hyper::Server::bind(&addr).serve(make_svc).await {
+                eprintln!("代理服务启动失败: {}", e);
+                std::process::exit(1);
+            }
+        });
     }
+
+    // 等待退出信号：Ctrl+C (SIGINT) / SIGTERM / SIGHUP（终端关闭）
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("注册 SIGTERM 失败");
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("注册 SIGHUP 失败");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = term.recv() => {},
+        _ = hup.recv() => {},
+    }
+
+    println!("\n收到退出信号，正在清理…");
+    // 若系统代理由本进程开启，恢复用户原有配置
+    if sysproxy::is_on() {
+        match sysproxy::disable() {
+            Ok(()) => println!("  已恢复系统代理设置"),
+            Err(e) => eprintln!("  恢复系统代理失败: {}（可手动执行 networksetup 或重启后重开一次代理再关闭）", e),
+        }
+    }
+    println!("MiniProxy 已退出。");
 }
 
 fn build_http_client(upstream: Option<dial::Upstream>) -> HttpClient {

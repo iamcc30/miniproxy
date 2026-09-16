@@ -43,6 +43,16 @@ pub async fn handle_api(
         (&Method::GET, "/api/health") => {
             json_response(serde_json::json!({"ok": true, "name": "miniproxy"}))
         }
+        (&Method::GET, "/api/info") => json_response(serde_json::json!({
+            "name": "miniproxy",
+            "apiPort": app.api_port,
+            "proxyPort": app.proxy_port,
+            "lanIp": app.lan_ip,
+            "caUrl": match &app.lan_ip {
+                Some(ip) => format!("http://{}:{}/api/ca.crt", ip, app.api_port),
+                None => "/api/ca.crt".to_string(),
+            },
+        })),
         (&Method::GET, _) => serve_static(&path).await,
         _ => not_found(),
     };

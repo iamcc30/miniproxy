@@ -445,7 +445,29 @@ pre.body-view {
   color: var(--text-primary);
 }
 
-.badge {
+pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal; }
+
+/* ---- 正文视图工具条：文本 / 十六进制 / Base64 + 复制 / 下载 ---- */
+.body-toolbar { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-3) 0 var(--space-2); flex-wrap: wrap; }
+.body-toolbar .sub-title { flex: none; }
+.view-switch { display: inline-flex; border: 1px solid var(--border-color); border-radius: var(--radius-sm); overflow: hidden; }
+.view-switch button {
+  border: none; background: var(--bg-tertiary); color: var(--text-secondary);
+  font-size: var(--text-xs); padding: 3px 10px; cursor: pointer; font-family: inherit;
+}
+.view-switch button + button { border-left: 1px solid var(--border-color); }
+.view-switch button:hover:not(:disabled) { color: var(--text-primary); }
+.view-switch button.active { background: var(--primary); color: #fff; }
+.view-switch button:disabled { opacity: 0.4; cursor: not-allowed; }
+.body-actions { display: inline-flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.body-actions button {
+  border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-secondary);
+  font-size: var(--text-xs); padding: 3px 8px; border-radius: var(--radius-sm);
+  cursor: pointer; font-family: inherit;
+}
+.body-actions button:hover:not(:disabled) { color: var(--text-primary); border-color: var(--primary); }
+.body-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+.raw-size { font-size: var(--text-xs); color: var(--text-muted); }
   display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 10px;
   background: var(--bg-tertiary); color: var(--text-secondary);
   border: 1px solid var(--border-color); margin-left: 6px;
@@ -454,6 +476,43 @@ pre.body-view {
 .badge.warn { color: var(--st-4xx); }
 .badge.err { color: var(--danger); }
 .badge.hit { color: var(--primary); border-style: dashed; font-weight: 600; }
+
+/* ---- 局域网设备（手机抓包）提示 ---- */
+.lan-banner {
+  flex: none;
+  display: flex; align-items: flex-start; gap: var(--space-4);
+  margin: var(--space-2) var(--space-4) 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border-color));
+  border-radius: var(--radius-md, 10px);
+  background: color-mix(in srgb, var(--primary) 7%, var(--bg-secondary));
+}
+.lan-text { flex: 1; min-width: 0; }
+.lan-title { font-size: var(--text-base); font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+.lan-steps { font-size: var(--text-sm); color: var(--text-secondary); line-height: 1.7; }
+.lan-steps ol { margin: 4px 0 0; padding-left: 18px; }
+.lan-steps code {
+  background: var(--bg-tertiary); border: 1px solid var(--border-color);
+  border-radius: 4px; padding: 1px 5px; font-family: var(--mono); font-size: 12px;
+  word-break: break-all;
+}
+.lan-copy {
+  margin-left: 6px; border: 1px solid var(--border-color); border-radius: 4px;
+  background: var(--bg-tertiary); color: var(--text-secondary);
+  font-size: 12px; padding: 1px 8px; cursor: pointer;
+}
+.lan-copy:hover { color: var(--primary); border-color: var(--primary); }
+.lan-qr {
+  flex: none; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 6px; background: #fff; border-radius: 8px;
+}
+.lan-qr span { font-size: 11px; color: #333; }
+.lan-close {
+  flex: none; width: 22px; height: 22px; line-height: 1;
+  border: none; border-radius: 50%; background: transparent;
+  color: var(--text-muted); font-size: 16px; cursor: pointer;
+}
+.lan-close:hover { background: var(--bg-tertiary); color: var(--text-primary); }
 
 /* WS 消息 */
 .ws-list { display: flex; flex-direction: column; gap: var(--space-2); }

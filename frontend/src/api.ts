@@ -23,6 +23,8 @@ export interface EntrySummary {
   wsClosed: boolean;
   done: boolean;
   error: string | null;
+  /** 对端 IP（识别局域网设备，如手机抓包） */
+  clientIp?: string;
   /** 关键词仅命中请求/响应内容时由服务端置位（用于列表标注「内容匹配」） */
   qInContent?: boolean;
 }
@@ -35,13 +37,23 @@ export interface WsMessage {
   ts: number;
 }
 
+/** 单侧正文的「原始字节」视图（base64 原文 + 原始大小 + 是否因过大被截断）。 */
+export interface RawView {
+  b64: string;
+  size: number;
+  truncated: boolean;
+}
+
 export interface EntryDetail extends EntrySummary {
   reqHeaders: [string, string][];
   reqBody: string | null;
+  reqBodyRaw: RawView | null;
   reqTruncated: boolean;
   respHeaders: [string, string][] | null;
   respBody: string | null;
+  respBodyRaw: RawView | null;
   respDecoded: string | null;
+  respDecodedRaw: RawView | null;
   decoded: string | null;
   respTruncated: boolean;
   wsMessages: WsMessage[];
@@ -278,6 +290,21 @@ export async function fetchEntries(f: Filters): Promise<{ items: EntrySummary[];
   return r.json();
 }
 
+export interface AppInfo {
+  name: string;
+  apiPort: number;
+  proxyPort: number;
+  /** 本机局域网出口 IP（用于手机等局域网设备访问） */
+  lanIp: string | null;
+  /** 供局域网设备下载 CA 证书的完整 URL */
+  caUrl: string;
+}
+
+export async function fetchInfo(): Promise<AppInfo> {
+  const r = await fetch('/api/info');
+  return r.json();
+}
+
 export async function fetchDetail(id: number): Promise<EntryDetail> {
   const r = await fetch(`/api/entries/${id}`);
   return r.json();
@@ -344,4 +371,97 @@ export function statusColor(status: number | null): string {
   if (status < 400) return 'st-3xx';
   if (status < 500) return 'st-4xx';
   return 'st-5xx';
+}
+
+/* ---------------- 原始数据视图（hex / base64 / 下载） ---------------- */
+
+/** base64 原文 -> 字节数组 */
+export function b64ToBytes(b64: string): Uint8Array {
+  try {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return new Uint8Array(0);
+  }
+}
+
+/** 字节数组 -> 经典 hex dump（偏移量 + 16 字节一行 + ASCII 列） */
+export function toHexDump(bytes: Uint8Array, maxBytes = 128 * 1024): string {
+  const n = Math.min(bytes.length, maxBytes);
+  const pad = (s: string, w: number) => s.padEnd(w, ' ');
+  const lines: string[] = [];
+  for (let off = 0; off < n; off += 16) {
+    const chunk = bytes.subarray(off, Math.min(off + 16, n));
+    const hexParts: string[] = [];
+    let ascii = '';
+    for (let i = 0; i < 16; i++) {
+      if (i < chunk.length) {
+        const b = chunk[i];
+        hexParts.push(b.toString(16).padStart(2, '0'));
+        ascii += b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.';
+      } else {
+        hexParts.push('  ');
+      }
+      if (i === 7) hexParts.push('');
+    }
+    lines.push(`${off.toString(16).padStart(8, '0')}  ${pad(hexParts.join(' '), 51)} |${ascii}|`);
+  }
+  if (bytes.length > n) {
+    lines.push(`… 共 ${bytes.length} 字节，此处仅显示前 ${n} 字节`);
+  }
+  return lines.join('\n');
+}
+
+/** base64 原文按列宽折行，便于阅读与复制 */
+export function wrapBase64(b64: string, width = 76): string {
+  const out: string[] = [];
+  for (let i = 0; i < b64.length; i += width) out.push(b64.slice(i, i + width));
+  return out.join('\n');
+}
+
+/**
+ * 判断文本视图是否已是「乱码」：二进制内容经 UTF-8 lossy 转码会得到大量替换字符（U+FFFD），
+ * 这类内容应默认走原始数据（十六进制）视图。
+ */
+export function looksBinary(text: string | null): boolean {
+  if (!text) return false;
+  if (text.includes('\u0000')) return true;
+  const len = text.length;
+  if (len < 8) return false;
+  let bad = 0;
+  let ctrl = 0;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0xfffd) bad++;
+    else if (c < 0x09 || (c > 0x0d && c < 0x20)) ctrl++;
+  }
+  return bad / len > 0.02 || ctrl / len > 0.05;
+}
+
+/** 触发浏览器下载原始字节 */
+export function downloadBytes(bytes: Uint8Array, filename: string): void {
+  const ab = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(ab).set(bytes);
+  const url = URL.createObjectURL(new Blob([ab], { type: 'application/octet-stream' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 由 URL 推导一个安全的下载文件名 */
+export function suggestFilename(url: string, fallback = 'body.bin'): string {
+  try {
+    const u = new URL(url);
+    const last = u.pathname.split('/').filter(Boolean).pop();
+    const name = last ? decodeURIComponent(last) : u.host;
+    return name.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80) || fallback;
+  } catch {
+    return fallback;
+  }
 }

@@ -4,9 +4,22 @@
 //! - enable 前把所有网络服务的现有代理配置备份到 ~/.miniproxy/sysproxy-backup.json，
 //!   disable 时优先按备份恢复（避免覆盖用户原有的代理，如 Clash 等）。
 //! - 关闭用 `-set...proxystate off`，不会留下 Enabled: Yes / Server: off 的脏状态。
+//! - 程序退出时自动恢复：
+//!   - 优雅退出（Ctrl+C / SIGTERM / SIGHUP）：主进程捕获信号后调用 disable()；
+//!   - 强杀 / 崩溃（kill -9）：enable 时孵化一个看门狗子进程
+//!     （`miniproxy --sysproxy-watchdog <父进程 PID>`），每秒探测父进程，
+//!     父进程消失即按备份恢复系统代理，防止系统代理指向已死端口断网。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+/// 本进程当前是否开启了系统代理（用于优雅退出时判断是否需要恢复）。
+static SYS_PROXY_ON: AtomicBool = AtomicBool::new(false);
+
+/// 看门狗子进程句柄（None 表示未孵化或已退出）。
+static WATCHDOG: Mutex<Option<std::process::Child>> = Mutex::new(None);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ServiceState {
@@ -24,6 +37,67 @@ struct Backup {
 
 pub fn supported() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// 本进程是否已开启系统代理。
+pub fn is_on() -> bool {
+    SYS_PROXY_ON.load(Ordering::SeqCst)
+}
+
+/// 孵化看门狗子进程（已存活则跳过）。父进程被强杀后由它负责恢复系统代理。
+fn spawn_watchdog() {
+    let mut g = WATCHDOG.lock().unwrap();
+    // 已有存活的看门狗则不重复孵化
+    if let Some(child) = g.as_mut() {
+        if child.try_wait().map(|st| st.is_none()).unwrap_or(true) {
+            return;
+        }
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let child = std::process::Command::new(exe)
+        .arg("--sysproxy-watchdog")
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match child {
+        Ok(c) => *g = Some(c),
+        Err(e) => eprintln!("孵化系统代理看门狗失败: {}", e),
+    }
+}
+
+/// 终止看门狗子进程（正常关闭系统代理或优雅退出时调用）。
+fn stop_watchdog() {
+    let mut g = WATCHDOG.lock().unwrap();
+    if let Some(mut child) = g.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// 看门狗主循环：每秒探测父进程是否存活，消失后按备份恢复系统代理并退出。
+/// 通过 `ps -p <pid> -o comm=` 检查（进程名含 miniproxy），同时规避 PID 复用误判。
+pub fn watchdog_run(parent_pid: &str) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let alive = std::process::Command::new("ps")
+            .args(["-p", parent_pid, "-o", "comm="])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_lowercase()
+                    .contains("miniproxy")
+            })
+            .unwrap_or(false);
+        if !alive {
+            let _ = disable();
+            std::process::exit(0);
+        }
+    }
 }
 
 fn backup_path() -> PathBuf {
@@ -127,6 +201,8 @@ pub fn enable(port: u16) -> Result<(), String> {
         let _ = run("networksetup", &["-setsocksfirewallproxy", &s, "127.0.0.1", &port_s]);
     }
     if errs.is_empty() {
+        SYS_PROXY_ON.store(true, Ordering::SeqCst);
+        spawn_watchdog();
         Ok(())
     } else {
         Err(errs.join("；"))
@@ -135,6 +211,8 @@ pub fn enable(port: u16) -> Result<(), String> {
 
 /// 关闭系统代理：优先按备份恢复用户原有配置，否则彻底关闭。
 pub fn disable() -> Result<(), String> {
+    SYS_PROXY_ON.store(false, Ordering::SeqCst);
+    stop_watchdog();
     let path = backup_path();
     let backup: Option<Backup> = std::fs::read_to_string(&path)
         .ok()
