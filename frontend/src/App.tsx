@@ -13,17 +13,22 @@ import {
   RESOURCE_OPTIONS,
   STATUS_OPTIONS,
   SysProxyStatus,
+  UpstreamStatus,
   RawView,
   b64ToBytes,
   clearEntries,
+  detectMediaKind,
+  disableUpstream,
   downloadBytes,
   emptyFacets,
   emptyFilters,
   fetchDetail,
   fetchEntries,
+  fetchEntryBody,
   fetchFacets,
   fetchInfo,
   fetchSysProxy,
+  fetchUpstream,
   filtersToQuery,
   formatBytes,
   formatTime,
@@ -34,12 +39,17 @@ import {
   hasAnyFilter,
   looksBinary,
   optionLabel,
+  rangeStartOf,
   resourceMeta,
+  scanUpstream,
   setSysProxy,
+  setUpstream,
   statusColor,
+  stitchEntryBody,
   suggestFilename,
   toHexDump,
   tryPrettyJson,
+  upstreamSourceLabel,
   wrapBase64,
 } from './api';
 import { QRCodeSVG } from 'qrcode.react';
@@ -58,6 +68,147 @@ function ThemeToggle() {
       <button className={theme === 'light' ? 'active' : ''} onClick={() => pick('light')} title="浅色">☀️</button>
       <button className={theme === 'dark' ? 'active' : ''} onClick={() => pick('dark')} title="深色">🌙</button>
       <button className={theme === 'system' ? 'active' : ''} onClick={() => pick('system')} title="跟随系统">💻</button>
+    </div>
+  );
+}
+
+/* ---------------- 上游级联开关 ---------------- */
+function UpstreamControl() {
+  const [st, setSt] = useState<UpstreamStatus | null>(null);
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [candidates, setCandidates] = useState<string[]>([]);
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err' | 'warn'; text: string } | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const refresh = useCallback(() => {
+    fetchUpstream().then(setSt).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  // 点击浮层外部关闭
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const scan = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await scanUpstream();
+      setCandidates(r.candidates.map((c) => c.addr));
+      setMsg(
+        r.candidates.length
+          ? { kind: 'ok', text: `检测到 ${r.candidates.length} 个可用代理，点击任一地址即可启用` }
+          : { kind: 'warn', text: '未检测到本机 HTTP 代理。若已运行 Clash/Charles，请手动填写其端口' }
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const apply = async (addr: string) => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await setUpstream(addr);
+      if (!r.ok) {
+        setMsg({ kind: 'err', text: r.error || '设置失败' });
+      } else {
+        setMsg({ kind: 'ok', text: r.warning || `已启用上游级联 ${r.addr}` });
+        setInput('');
+      }
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const turnOff = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      await disableUpstream();
+      setMsg({ kind: 'ok', text: '已关闭上游级联，出站恢复直连' });
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const enabled = !!st?.enabled;
+  return (
+    <div className="upstream-wrap" ref={wrapRef}>
+      <button
+        className={`btn ${enabled ? 'primary' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        title={
+          enabled
+            ? `出站流量经上游代理 ${st?.addr} 转发（来源：${upstreamSourceLabel(st?.source)}）`
+            : '未启用上游级联：被墙/海外站点的 TLS 握手会失败，点此一键检测本机代理并级联'
+        }
+      >
+        {enabled ? `🔗 上游 ${st?.addr}` : '🔗 上游级联'}
+      </button>
+      {open && (
+        <div className="upstream-pop">
+          <div className="upstream-pop-title">上游级联（出站代理）</div>
+          <div className="upstream-pop-desc">
+            开启后 MiniProxy 到源站的流量先经上游代理转发，HTTPS 仍会被解密抓包。
+            适合本机开着 Clash/Charles 又想抓被墙站点的情况。
+          </div>
+          <div className="upstream-pop-row">
+            <button className="btn" disabled={busy} onClick={scan}>
+              {busy ? '检测中…' : '🔍 自动检测本机代理'}
+            </button>
+            {enabled && (
+              <button className="btn danger" disabled={busy} onClick={turnOff}>
+                关闭级联
+              </button>
+            )}
+          </div>
+          {candidates.length > 0 && (
+            <div className="upstream-candidates">
+              {candidates.map((c) => (
+                <button key={c} className="chip-btn" disabled={busy} onClick={() => apply(c)}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="upstream-pop-row">
+            <input
+              className="upstream-input"
+              placeholder="手动填写 host:port，如 127.0.0.1:7890"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && input.trim()) apply(input.trim());
+              }}
+            />
+            <button className="btn" disabled={busy || !input.trim()} onClick={() => apply(input.trim())}>
+              启用
+            </button>
+          </div>
+          {msg && <div className={`upstream-msg ${msg.kind}`}>{msg.text}</div>}
+          {st?.source === 'env' && st.envAddr && (
+            <div className="upstream-msg warn">
+              当前由环境变量 MINIPROXY_UPSTREAM_PROXY={st.envAddr} 指定，优先级最高
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -235,6 +386,8 @@ export default function App() {
   const [entries, setEntries] = useState<EntrySummary[]>([]);
   const [facets, setFacets] = useState<Facets>(emptyFacets());
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  // 详情面板默认收起：点左侧记录才展开，可通过关闭按钮 / Esc 收起
+  const [panelOpen, setPanelOpen] = useState(false);
   const [detail, setDetail] = useState<EntryDetail | null>(null);
   const [groupBy, setGroupBy] = useState<GroupDim>('none');
   const [qInput, setQInput] = useState('');
@@ -248,6 +401,8 @@ export default function App() {
   const [sysBusy, setSysBusy] = useState(false);
   const [info, setInfo] = useState<Awaited<ReturnType<typeof fetchInfo>> | null>(null);
   const [lanDismissed, setLanDismissed] = useState(false);
+  // 局域网帮助默认收起：点提示条才展开说明与二维码
+  const [lanHelpOpen, setLanHelpOpen] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
@@ -414,6 +569,13 @@ export default function App() {
     return null;
   }, [entries]);
 
+  // 局域网证书下载地址：优先后端给的完整 URL；否则按检测到的设备 IP / 本机局域网 IP 推导（泛解析 xip 风格域名）
+  const lanCaUrl = useMemo(() => {
+    if (info && !info.caUrl.startsWith('/')) return info.caUrl;
+    const ip = lanDeviceIp ?? info?.lanIp ?? null;
+    return ip ? `http://${ip.split('.').slice(0, 3).join('.')}.x:${info?.apiPort ?? 9000}/api/ca.crt` : null;
+  }, [info, lanDeviceIp]);
+
   const toggleSysProxy = useCallback(async () => {
     if (!sysProxy?.supported || sysBusy) return;
     const next = !sysProxy.active;
@@ -500,7 +662,24 @@ export default function App() {
     setEntries([]);
     setSelectedId(null);
     setDetail(null);
+    setPanelOpen(false);
   };
+
+  /** 点左侧记录：记录选中并展开右侧详情面板 */
+  const handleSelect = useCallback((id: number) => {
+    setSelectedId(id);
+    setPanelOpen(true);
+  }, []);
+
+  // 面板打开时按 Esc 收起
+  useEffect(() => {
+    if (!panelOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPanelOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [panelOpen]);
 
   return (
     <div className="app">
@@ -538,6 +717,7 @@ export default function App() {
             {sysProxy.active ? '🌐 系统代理 已开启' : '🌐 系统代理 已关闭'}
           </button>
         )}
+        <UpstreamControl />
         <a className="btn" href={`/api/export?format=json&${exportQuery}`} target="_blank" rel="noreferrer">
           导出 JSON
         </a>
@@ -667,53 +847,94 @@ export default function App() {
         </div>
       )}
 
-      {lanDeviceIp && !lanDismissed && (
+      {!lanDismissed && (
         <div className="lan-banner">
-          <div className="lan-text">
-            <div className="lan-title">📱 检测到局域网设备 {lanDeviceIp} 正在使用代理</div>
-            <div className="lan-steps">
-              TLS 握手失败是因为该设备尚未信任 MiniProxy CA 证书。安装步骤：
-              <ol>
-                <li>
-                  手机浏览器打开{' '}
-                  <code>{info && !info.caUrl.startsWith('/') ? info.caUrl : `http://${lanDeviceIp.split('.').slice(0, 3).join('.')}.x:${info?.apiPort ?? 9000}/api/ca.crt`}</code>{' '}
-                  下载证书
-                  <button
-                    type="button"
-                    className="lan-copy"
-                    onClick={() => {
-                      if (info && !info.caUrl.startsWith('/')) navigator.clipboard?.writeText(info.caUrl);
-                    }}
-                    title="复制证书下载地址"
-                  >
-                    复制地址
-                  </button>
-                </li>
-                <li>
-                  <b>iOS</b>：设置 → 通用 → VPN与设备管理 → 安装描述文件，再到「设置 → 通用 →
-                  关于本机 → <b>证书信任设置</b>」开启完全信任（关键，漏掉这步仍会握手失败）
-                </li>
-                <li>
-                  <b>Android</b>：设置 → 安全 → 更多安全设置 → 加密与凭据 → 安装 CA 证书
-                  （安卓 7+ 多数 App 默认不信任用户证书，仅浏览器等可用）
-                </li>
-                <li>个别 App 有证书固定（pinning），装了证书也无法解密，属正常现象</li>
-              </ol>
-            </div>
+          <div className="lan-bar">
+            <span className="lan-hint">
+              {lanDeviceIp
+                ? `📱 检测到局域网设备 ${lanDeviceIp} 正在使用代理`
+                : '📱 想用手机 / 局域网设备抓包？让手机代理指向本机即可，首次使用需安装 CA 证书'}
+            </span>
+            {info?.lanIp && (
+              <CopyButton
+                text={`${info.lanIp}:${info.proxyPort}`}
+                label={`📶 代理 ${info.lanIp}:${info.proxyPort}`}
+                title="点击复制手机 Wi-Fi 代理要填的地址"
+              />
+            )}
+            <button
+              type="button"
+              className={`lan-help-btn${lanHelpOpen ? ' open' : ''}`}
+              onClick={() => setLanHelpOpen((o) => !o)}
+              title="展开/收起手机抓包证书配置帮助"
+            >
+              {lanHelpOpen ? '收起帮助 ▴' : '证书配置帮助 ▾'}
+            </button>
+            <button type="button" className="lan-close" title="不再提示" onClick={() => setLanDismissed(true)}>
+              ×
+            </button>
           </div>
-          {info && !info.caUrl.startsWith('/') && (
-            <div className="lan-qr" title="手机扫码打开证书下载页">
-              <QRCodeSVG value={info.caUrl} size={72} />
-              <span>扫码下载证书</span>
+          {lanHelpOpen && (
+            <div className="lan-detail-row">
+              <div className="lan-text">
+                <div className="lan-steps">
+                  {lanDeviceIp
+                    ? 'TLS 握手失败是因为该设备尚未信任 MiniProxy CA 证书。安装步骤：'
+                    : '手机等局域网设备走本代理抓包 HTTPS，需先安装并信任 MiniProxy CA 证书。步骤：'}
+                  <ol>
+                    <li>
+                      {info?.lanIp ? (
+                        <>
+                          手机 Wi-Fi 代理设为手动：服务器 <code>{info.lanIp}</code>，端口{' '}
+                          <code>{info.proxyPort}</code>
+                        </>
+                      ) : (
+                        <>手机与电脑连同一 Wi-Fi，代理指向电脑的局域网 IP:{info?.proxyPort ?? 34567}</>
+                      )}
+                    </li>
+                    <li>
+                      {lanCaUrl ? (
+                        <>
+                          手机浏览器打开 <code>{lanCaUrl}</code> 下载证书
+                          <button
+                            type="button"
+                            className="lan-copy"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(lanCaUrl);
+                            }}
+                            title="复制证书下载地址"
+                          >
+                            复制地址
+                          </button>
+                        </>
+                      ) : (
+                        <>浏览器访问 <code>/api/ca.crt</code> 下载证书</>
+                      )}
+                    </li>
+                    <li>
+                      <b>iOS</b>：设置 → 通用 → VPN与设备管理 → 安装描述文件，再到「设置 → 通用 →
+                      关于本机 → <b>证书信任设置</b>」开启完全信任（关键，漏掉这步仍会握手失败）
+                    </li>
+                    <li>
+                      <b>Android</b>：设置 → 安全 → 更多安全设置 → 加密与凭据 → 安装 CA 证书
+                      （安卓 7+ 多数 App 默认不信任用户证书，仅浏览器等可用）
+                    </li>
+                    <li>个别 App 有证书固定（pinning），装了证书也无法解密，属正常现象</li>
+                  </ol>
+                </div>
+              </div>
+              {lanCaUrl && (
+                <div className="lan-qr" title="手机扫码打开证书下载页">
+                  <QRCodeSVG value={lanCaUrl} size={72} />
+                  <span>扫码下载证书</span>
+                </div>
+              )}
             </div>
           )}
-          <button type="button" className="lan-close" title="不再提示" onClick={() => setLanDismissed(true)}>
-            ×
-          </button>
         </div>
       )}
 
-      <div className="main">
+      <div className={`main${panelOpen ? ' with-detail' : ''}`}>
         <section className="list-pane">
           <div className="list-meta">
             共 {entries.length} 条{hasAnyFilter(filters) ? ' · 已筛选' : ''}
@@ -769,26 +990,36 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                    {!isCollapsed && <EntryTable items={items} selectedId={selectedId} onSelect={setSelectedId} />}
+                    {!isCollapsed && <EntryTable items={items} selectedId={selectedId} onSelect={handleSelect} />}
                   </React.Fragment>
                 );
               })
             ) : (
-              <EntryTable items={entries} selectedId={selectedId} onSelect={setSelectedId} />
+              <EntryTable items={entries} selectedId={selectedId} onSelect={handleSelect} />
             )}
           </div>
         </section>
 
-        <section className="detail-pane">
-          {detail ? (
-            <Detail detail={detail} tab={tab} setTab={setTab} />
-          ) : (
-            <div className="empty-state">
-              <div style={{ fontSize: 28 }}>🔍</div>
-              <div>选择左侧任意记录查看详情</div>
-            </div>
-          )}
-        </section>
+        {panelOpen && (
+          <section className="detail-pane">
+            <button
+              type="button"
+              className="detail-close"
+              title="关闭详情面板（Esc）"
+              onClick={() => setPanelOpen(false)}
+            >
+              ×
+            </button>
+            {detail ? (
+              <Detail detail={detail} tab={tab} setTab={setTab} />
+            ) : (
+              <div className="empty-state">
+                <div style={{ fontSize: 28 }}>⏳</div>
+                <div>正在加载详情…</div>
+              </div>
+            )}
+          </section>
+        )}
       </div>
     </div>
   );
@@ -818,7 +1049,7 @@ function EntryTable({
           <th>方法</th>
           <th>状态</th>
           <th>URL</th>
-          <th>大小</th>
+          <th title="↑ 请求体大小 · ↓ 响应体大小">大小</th>
           <th>时间</th>
         </tr>
       </thead>
@@ -847,10 +1078,18 @@ function EntryTable({
               )}
               {e.error && <span className="badge err" title={e.error}>!</span>}
             </td>
-            <td title={`↑ ${formatBytes(e.bytesUp)} / ↓ ${formatBytes(e.bytesDown)}`}>
-              {e.kind === 'tcp'
-                ? `↑${formatBytes(e.bytesUp)} ↓${formatBytes(e.bytesDown)}`
-                : formatBytes(e.respSize || e.bytesDown)}
+            <td
+              className="size-cell"
+              title={`请求体: ${formatBytes(e.reqSize)} · 响应体: ${formatBytes(e.respSize || e.bytesDown)}\n网络流量: ↑ ${formatBytes(e.bytesUp)} / ↓ ${formatBytes(e.bytesDown)}`}
+            >
+              {e.kind === 'tcp' ? (
+                <>↑{formatBytes(e.bytesUp)} ↓{formatBytes(e.bytesDown)}</>
+              ) : (
+                <>
+                  <span className="size-up">↑{formatBytes(e.reqSize)}</span>{' '}
+                  <span className="size-down">↓{formatBytes(e.respSize || e.bytesDown)}</span>
+                </>
+              )}
             </td>
             <td>{formatTime(e.ts)}</td>
           </tr>
@@ -877,10 +1116,46 @@ function HeadersTable({ headers }: { headers: [string, string][] }) {
   );
 }
 
-type BodyViewMode = 'text' | 'hex' | 'base64';
+type BodyViewMode = 'text' | 'hex' | 'base64' | 'preview';
+
+/** 小号复制按钮：点击复制文本，1.5 秒内反馈「已复制」。 */
+function CopyButton({
+  text,
+  disabled,
+  label = '复制',
+  title,
+}: {
+  text: string;
+  disabled?: boolean;
+  label?: string;
+  title?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="mini-copy"
+      disabled={disabled}
+      title={title ?? '复制内容'}
+      onClick={async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          setCopied(false);
+        }
+      }}
+    >
+      {copied ? '已复制' : label}
+    </button>
+  );
+}
 
 /**
- * 正文查看器：文本 / 十六进制 / Base64 三种视图，支持复制与下载原始字节。
+ * 正文查看器：预览 / 文本 / 十六进制 / Base64 四种视图，支持复制与下载原始字节。
+ * 图片、音视频、PDF 等多媒体内容默认直接内嵌预览；
  * 二进制或压缩内容在文本视图里会显示为乱码，此时自动切到十六进制并给出提示。
  */
 function BodyView({
@@ -890,6 +1165,11 @@ function BodyView({
   truncated,
   label,
   url,
+  contentType,
+  entryId,
+  side = 'resp',
+  bodyTruncated,
+  rangeStart,
 }: {
   text: string | null;
   /** 与 text 对应的原始字节（base64），用于十六进制 / Base64 / 下载 */
@@ -899,17 +1179,108 @@ function BodyView({
   label?: string;
   /** 用于推导下载文件名 */
   url?: string;
+  /** 响应 Content-Type，用于判断是否可内嵌预览 */
+  contentType?: string | null;
+  /** 条目 ID：视图数据被 256 KB 截断时，预览/下载会改从完整正文接口拉全量 */
+  entryId?: number;
+  /** 拉取哪一侧的完整正文 */
+  side?: 'req' | 'resp';
+  /** 抓包时正文本身就被截断（超 4 MB），完整播放本就不可用 */
+  bodyTruncated?: boolean;
+  /** 请求 Range 起始字节：>0 说明该条目是 Range 分块抓取的一部分 */
+  rangeStart?: number | null;
 }) {
   const bytes = useMemo(() => (raw ? b64ToBytes(raw.b64) : new Uint8Array(0)), [raw]);
   const binary = looksBinary(text);
   const [mode, setMode] = useState<BodyViewMode>('text');
   const [copied, setCopied] = useState(false);
 
+  // 可预览的多媒体：Content-Type 优先，缺失时按魔数嗅探
+  const media = useMemo(
+    () => (raw && bytes.length > 0 ? detectMediaKind(contentType, bytes) : null),
+    [contentType, raw, bytes],
+  );
+
+  // 视图数据被截断但完整正文可取时，预览/下载前先拉全量
+  const needsFull = !!(media && raw?.truncated && entryId != null);
+  const [full, setFull] = useState<Uint8Array | null>(null);
+  const [fullErr, setFullErr] = useState(false);
+  useEffect(() => {
+    setFull(null);
+    setFullErr(false);
+    if (!needsFull) return;
+    let cancel = false;
+    fetchEntryBody(entryId!, side).then((r) => {
+      if (cancel) return;
+      if (r) setFull(r.bytes);
+      else setFullErr(true);
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [needsFull, entryId, side]);
+
+  // 预览用的 Blob URL，随内容变化重建并释放旧的
+  const mediaUrl = useMemo(() => {
+    if (!media) return null;
+    const b = full ?? bytes;
+    if (b.length === 0) return null;
+    const ab = new ArrayBuffer(b.byteLength);
+    new Uint8Array(ab).set(b);
+    return URL.createObjectURL(new Blob([ab], { type: media.mime }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [media, raw, full]);
+
+  useEffect(() => () => { if (mediaUrl) URL.revokeObjectURL(mediaUrl); }, [mediaUrl]);
+
+  // 分段视频（DASH .m4s / Range 分块）：请求后端拼接后播放
+  const isSegment = media?.kind === 'segment';
+  const isRangeChunk = media?.kind === 'video' && (rangeStart ?? 0) > 0;
+  type StitchState =
+    | { state: 'idle' }
+    | { state: 'loading' }
+    | { state: 'ok'; url: string; note: string | null }
+    | { state: 'err'; error: string };
+  const [stitch, setStitch] = useState<StitchState>({ state: 'idle' });
+
+  const ensureStitch = useCallback(() => {
+    if (entryId == null || stitch.state === 'loading') return;
+    setStitch({ state: 'loading' });
+    stitchEntryBody(entryId, side).then((r) => {
+      if (r.ok) {
+        const ab = new ArrayBuffer(r.bytes.byteLength);
+        new Uint8Array(ab).set(r.bytes);
+        const url = URL.createObjectURL(new Blob([ab], { type: 'video/mp4' }));
+        setStitch({ state: 'ok', url, note: r.note });
+      } else {
+        setStitch({ state: 'err', error: r.error });
+      }
+    });
+  }, [entryId, side, stitch.state]);
+
+  useEffect(() => {
+    setStitch({ state: 'idle' });
+  }, [isSegment, isRangeChunk, entryId, side]);
+
+  useEffect(() => {
+    // DASH 分段自动尝试拼接；Range 分块等用户点击
+    if (isSegment) ensureStitch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSegment, entryId, side]);
+
+  useEffect(
+    () => () => {
+      if (stitch.state === 'ok') URL.revokeObjectURL(stitch.url);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [stitch.state === 'ok' ? stitch.url : null],
+  );
+
   // 切换到另一条记录时，依据内容类型重置默认视图
   useEffect(() => {
-    setMode(looksBinary(text) ? 'hex' : 'text');
+    setMode(media ? 'preview' : looksBinary(text) ? 'hex' : 'text');
     setCopied(false);
-  }, [text]);
+  }, [text, media]);
 
   const pretty = mode === 'text' ? tryPrettyJson(text) : null;
   const shown =
@@ -921,6 +1292,15 @@ function BodyView({
 
   const hasBody = !!text || bytes.length > 0;
   const downloadable = bytes.length > 0;
+
+  // 音视频 / m3u8：可从源站重新拉取完整文件（m3u8 自动拼接全部分段）
+  const ctLow = (contentType ?? '').toLowerCase();
+  const canFullVideo =
+    entryId != null &&
+    (ctLow.split(';')[0].startsWith('video/') ||
+      ctLow.split(';')[0].startsWith('audio/') ||
+      ctLow.includes('mpegurl') ||
+      (url ?? '').toLowerCase().includes('.m3u8'));
 
   const copy = async () => {
     try {
@@ -939,6 +1319,7 @@ function BodyView({
         <div className="view-switch" role="group" aria-label="正文视图">
           {(
             [
+              ...(media ? ([['preview', '预览']] as [BodyViewMode, string][]) : []),
               ['text', '文本'],
               ['hex', '十六进制'],
               ['base64', 'Base64'],
@@ -965,17 +1346,38 @@ function BodyView({
           <button type="button" onClick={copy} disabled={!hasBody}>
             {copied ? '已复制' : '复制'}
           </button>
+          {canFullVideo && (
+            <button
+              type="button"
+              title="不依赖抓包碎片，直接从源站重新拉取完整文件（m3u8 会自动解析并拼接全部分段）"
+              onClick={() => {
+                window.location.href = `/api/entries/${entryId}/fullvideo`;
+              }}
+            >
+              下载完整视频
+            </button>
+          )}
           <button
             type="button"
             disabled={!downloadable}
-            title="下载原始字节"
-            onClick={() => downloadBytes(bytes, suggestFilename(url ?? ''))}
+            title="下载原始字节（视图被截断时自动拉取完整正文）"
+            onClick={async () => {
+              let b = full;
+              if (!b && entryId != null && raw?.truncated) {
+                const r = await fetchEntryBody(entryId, side);
+                if (r) {
+                  setFull(r.bytes);
+                  b = r.bytes;
+                }
+              }
+              downloadBytes(b ?? bytes, suggestFilename(url ?? ''));
+            }}
           >
             下载原始数据
           </button>
         </div>
       </div>
-      {(decoded || truncated || binary) && (
+      {(decoded || truncated || binary) && mode !== 'preview' && (
         <div style={{ marginBottom: 8 }}>
           {decoded && <span className="badge decode">已解压：{decoded}</span>}
           {truncated && <span className="badge warn">内容过大，已截断</span>}
@@ -990,7 +1392,64 @@ function BodyView({
           )}
         </div>
       )}
-      {hasBody ? (
+      {mode === 'preview' && mediaUrl && media && (
+        <div style={{ marginBottom: 8 }}>
+          {media.kind === 'segment' && stitch.state === 'ok' && (
+            <span className="badge">分段视频已拼接{stitch.note ? ` · ${stitch.note}` : ''}</span>
+          )}
+          {media.kind === 'segment' && stitch.state !== 'ok' && (
+            <span className="badge">DASH 分段（.m4s）· 需拼接后播放</span>
+          )}
+          {isRangeChunk && (
+            <span className="badge">Range 分块（起点 {rangeStart}）· 非完整文件</span>
+          )}
+          {bodyTruncated && media.kind !== 'image' && (
+            <span className="badge warn">
+              源内容超过 4 MB，抓包时已截断，完整播放可能不可用（建议用「下载原始数据」）
+            </span>
+          )}
+          {!bodyTruncated && raw?.truncated && !full && !fullErr && (
+            <span className="badge">正在加载完整内容…</span>
+          )}
+          {fullErr && raw?.truncated && !full && (
+            <span className="badge warn">完整内容加载失败，预览基于前 256 KB</span>
+          )}
+          {bodyTruncated && media.kind === 'image' && (
+            <span className="badge warn">源内容超过 4 MB 已截断，图片可能不完整</span>
+          )}
+          {media.kind === 'image' && (
+            <span className="badge">图片预览 · {media.mime}</span>
+          )}
+        </div>
+      )}
+      {mode === 'preview' && media && (isSegment || isRangeChunk) ? (
+        <>
+          <div className="media-preview mp-video">
+            {stitch.state === 'ok' ? (
+              <video src={stitch.url} controls preload="metadata" />
+            ) : stitch.state === 'loading' ? (
+              <div className="sub-title">正在拼接分段视频…</div>
+            ) : stitch.state === 'err' ? (
+              <div className="stitch-err">{stitch.error}</div>
+            ) : (
+              <button type="button" className="stitch-btn" onClick={ensureStitch}>
+                拼接同一 URL 的 Range 分块并播放
+              </button>
+            )}
+          </div>
+        </>
+      ) : mode === 'preview' && mediaUrl && media ? (
+        <div className={`media-preview mp-${media.kind}`}>
+          {media.kind === 'image' && <img src={mediaUrl} alt="响应内容预览" />}
+          {media.kind === 'video' && (
+            <video src={mediaUrl} controls preload="metadata" />
+          )}
+          {media.kind === 'audio' && (
+            <audio src={mediaUrl} controls preload="metadata" />
+          )}
+          {media.kind === 'pdf' && <iframe src={mediaUrl} title="PDF 预览" />}
+        </div>
+      ) : hasBody ? (
         <pre className={`body-view${mode === 'hex' ? ' hex-view' : ''}`}>{shown}</pre>
       ) : (
         <div className="sub-title">（空）</div>
@@ -1053,6 +1512,10 @@ function Detail({
                 truncated={detail.reqTruncated}
                 label="请求体"
                 url={detail.url}
+                contentType={detail.contentType}
+                entryId={detail.id}
+                side="req"
+                bodyTruncated={detail.reqTruncated}
               />
             )}
           </>
@@ -1068,6 +1531,11 @@ function Detail({
               truncated={detail.respTruncated}
               label={detail.decoded ? `响应体（已从 ${detail.decoded} 解压）` : '响应体'}
               url={detail.url}
+              contentType={detail.contentType}
+              entryId={detail.id}
+              side="resp"
+              bodyTruncated={detail.respTruncated}
+              rangeStart={rangeStartOf(detail.reqHeaders)}
             />
           </>
         )}
@@ -1075,6 +1543,23 @@ function Detail({
           <>
             {!detail.done && <div className="sub-title" style={{ color: 'var(--accent)' }}>● 连接进行中，消息实时追加…</div>}
             {detail.done && <div className="sub-title">连接已关闭</div>}
+            <div className="ws-toolbar">
+              <span className="sub-title" style={{ margin: 0 }}>
+                共 {detail.wsMessages.length} 条消息
+              </span>
+              <CopyButton
+                label="复制全部"
+                title="按顺序复制全部消息（含方向、类型、大小）"
+                disabled={detail.wsMessages.length === 0}
+                text={detail.wsMessages
+                  .map(
+                    (m) =>
+                      `[${formatTime(m.ts)}] ${m.dir === 'c2s' ? '↑ 客户端 → 服务器' : '↓ 服务器 → 客户端'} ` +
+                      `${m.kind} · ${m.size} B${m.truncated ? '（内容已截断）' : ''}\n${m.data ?? ''}`,
+                  )
+                  .join('\n\n')}
+              />
+            </div>
             <div className="ws-list">
               {detail.wsMessages.length === 0 && <div className="sub-title">（暂无消息）</div>}
               {detail.wsMessages.map((m, i) => (
@@ -1082,8 +1567,21 @@ function Detail({
                   <div className="ws-meta">
                     <span className="dir-tag">{m.dir === 'c2s' ? '↑ 客户端 → 服务器' : '↓ 服务器 → 客户端'}</span>
                     <span>{m.kind}</span>
-                    <span>{formatBytes(m.size)}</span>
+                    <span title="payload 原始字节数">{formatBytes(m.size)}</span>
+                    {m.data != null && (
+                      <span title="可展示文本的字符数（一个汉字算 1 字符）">{`${m.data.length} 字符`}</span>
+                    )}
+                    {m.truncated && (
+                      <span style={{ color: 'var(--accent)' }} title="连接文本额度已用尽，本条只保留了前面部分">
+                        内容已截断
+                      </span>
+                    )}
                     <span>{formatTime(m.ts)}</span>
+                    <CopyButton
+                      text={m.data ?? ''}
+                      disabled={m.data == null}
+                      title={m.data == null ? '该帧没有文本内容（二进制 / 控制帧）' : '复制本条消息文本'}
+                    />
                   </div>
                   {m.data != null && <pre>{m.data}</pre>}
                 </div>

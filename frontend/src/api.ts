@@ -32,8 +32,11 @@ export interface EntrySummary {
 export interface WsMessage {
   dir: 'c2s' | 's2c';
   kind: string;
+  /** payload 原始字节数（中文一个字 3 字节，与下方文本的字符数不同） */
   size: number;
   data: string | null;
+  /** 文本内容是否被截断（连接文本额度用尽） */
+  truncated?: boolean;
   ts: number;
 }
 
@@ -342,6 +345,79 @@ export async function setSysProxy(enable: boolean): Promise<SysProxyStatus> {
   return r.json();
 }
 
+/* ---------------- 上游级联 ---------------- */
+
+export interface UpstreamStatus {
+  enabled: boolean;
+  /** 生效中的地址，形如 127.0.0.1:7890 */
+  addr: string | null;
+  /** env / saved / auto / manual / off */
+  source: string;
+  /** 若用环境变量指定了上游，这里给出其值（优先级高于界面设置） */
+  envAddr: string | null;
+}
+
+export interface UpstreamResult {
+  ok: boolean;
+  enabled?: boolean;
+  addr?: string;
+  source?: string;
+  error?: string;
+  warning?: string;
+}
+
+export interface UpstreamCandidate {
+  addr: string;
+  reachable: boolean;
+}
+
+export async function fetchUpstream(): Promise<UpstreamStatus> {
+  const r = await fetch('/api/upstream');
+  return r.json();
+}
+
+/** 启用上游级联（保存前后端会做连通性测试） */
+export async function setUpstream(addr: string): Promise<UpstreamResult> {
+  const r = await fetch('/api/upstream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ addr }),
+  });
+  return r.json();
+}
+
+export async function disableUpstream(): Promise<UpstreamResult> {
+  const r = await fetch('/api/upstream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  return r.json();
+}
+
+/** 扫描本机常见代理端口（Clash/Charles/Surge/v2ray…） */
+export async function scanUpstream(): Promise<{ ok: boolean; candidates: UpstreamCandidate[] }> {
+  const r = await fetch('/api/upstream/scan', { method: 'POST' });
+  return r.json();
+}
+
+export function upstreamSourceLabel(source?: string): string {
+  switch (source) {
+    case 'env':
+      return '环境变量';
+    case 'saved':
+      return '上次保存';
+    case 'auto':
+      return '自动检测';
+    case 'manual':
+      return '手动设置';
+    case 'auto-pending':
+      return '检测中…';
+    default:
+      return '';
+  }
+}
+
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -440,9 +516,150 @@ export function looksBinary(text: string | null): boolean {
   return bad / len > 0.02 || ctrl / len > 0.05;
 }
 
+/* ---------------- 多媒体预览 ---------------- */
+
+/**
+ * 拉取某条记录的完整原始正文（后端最多保留 4 MB）。
+ * 详情接口的原始字节视图只回传前 256 KB，多媒体预览 / 全量下载需要这里补齐。
+ */
+export async function fetchEntryBody(
+  id: number,
+  side: 'req' | 'resp',
+): Promise<{ bytes: Uint8Array; truncated: boolean } | null> {
+  try {
+    const resp = await fetch(`/api/entries/${id}/body?side=${side}`);
+    if (!resp.ok) return null;
+    const buf = await resp.arrayBuffer();
+    return {
+      bytes: new Uint8Array(buf),
+      truncated: resp.headers.get('X-Miniproxy-Truncated') === '1',
+    };
+  } catch {
+    return null;
+  }
+}
+
+export type MediaKind = 'image' | 'video' | 'audio' | 'pdf' | 'segment';
+
+export interface MediaInfo {
+  kind: MediaKind;
+  mime: string;
+}
+
+/** 依据字节头（魔数）嗅探常见多媒体格式 */
+export function sniffMedia(bytes: Uint8Array): MediaInfo | null {
+  const b = bytes;
+  if (b.length < 12) return null;
+  const sig = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) if (b[off + i] !== s.charCodeAt(i)) return false;
+    return true;
+  };
+  const eq = (off: number, ...vals: number[]) => vals.every((v, i) => b[off + i] === v);
+  // fMP4 媒体分段（推特 .m4s 等）：styp / moof / sidx 开头，单独播放不了，需要拼接
+  if (sig(4, 'styp') || sig(4, 'moof') || sig(4, 'sidx')) return { kind: 'segment', mime: 'video/mp4' };
+  if (eq(0, 0x89, 0x50, 0x4e, 0x47)) return { kind: 'image', mime: 'image/png' };
+  if (eq(0, 0xff, 0xd8, 0xff)) return { kind: 'image', mime: 'image/jpeg' };
+  if (sig(0, 'GIF8')) return { kind: 'image', mime: 'image/gif' };
+  if (sig(0, 'BM')) return { kind: 'image', mime: 'image/bmp' };
+  if (eq(0, 0, 0, 1, 0)) return { kind: 'image', mime: 'image/x-icon' };
+  if (sig(0, 'RIFF') && sig(8, 'WEBP')) return { kind: 'image', mime: 'image/webp' };
+  if (sig(0, 'RIFF') && sig(8, 'WAVE')) return { kind: 'audio', mime: 'audio/wav' };
+  if (sig(0, '%PDF')) return { kind: 'pdf', mime: 'application/pdf' };
+  if (sig(4, 'ftyp')) return { kind: 'video', mime: 'video/mp4' };
+  if (eq(0, 0x1a, 0x45, 0xdf, 0xa3)) return { kind: 'video', mime: 'video/webm' };
+  if (sig(0, 'OggS')) return { kind: 'audio', mime: 'audio/ogg' };
+  if (sig(0, 'ID3') || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0))
+    return { kind: 'audio', mime: 'audio/mpeg' };
+  if (sig(0, 'fLaC')) return { kind: 'audio', mime: 'audio/flac' };
+  // SVG：开头是 <svg 或前 512 字节内含 <svg 标签
+  if (sig(0, '<svg')) return { kind: 'image', mime: 'image/svg+xml' };
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 512));
+  if (head.includes('<svg')) return { kind: 'image', mime: 'image/svg+xml' };
+  return null;
+}
+
+/** Content-Type -> 可预览类型 */
+function ctMediaOf(ct: string): MediaInfo | null {
+  const t = ct.split(';')[0].trim().toLowerCase();
+  if (!t) return null;
+  if (t === 'application/pdf') return { kind: 'pdf', mime: 'application/pdf' };
+  if (t.startsWith('image/')) return { kind: 'image', mime: t };
+  if (t.startsWith('video/')) return { kind: 'video', mime: t };
+  if (t.startsWith('audio/')) return { kind: 'audio', mime: t };
+  return null;
+}
+
+/**
+ * 判断响应是否可内嵌预览：优先信 Content-Type，缺失或不可识别时按魔数嗅探。
+ * DASH 媒体分段（styp/moof/sidx 开头）优先于 Content-Type 判定——
+ * 这类内容 Content-Type 常标为 video/mp4 但单独播放不了。
+ * 返回 null 表示没有合适的内嵌预览方式（继续走文本 / hex / base64）。
+ */
+export function detectMediaKind(
+  contentType: string | null | undefined,
+  bytes: Uint8Array,
+): MediaInfo | null {
+  const sniffed = sniffMedia(bytes);
+  if (sniffed?.kind === 'segment') return sniffed;
+  const ct = (contentType ?? '').split(';')[0].trim().toLowerCase();
+  if (ct) {
+    const m = ctMediaOf(ct);
+    if (m) return m;
+  }
+  return sniffed;
+}
+
+/** 拼接结果：成功带字节与说明（init/分段数），失败带原因 */
+export type StitchResult =
+  | { ok: true; bytes: Uint8Array; note: string | null }
+  | { ok: false; error: string };
+
+/**
+ * 请求后端拼接分段视频：
+ * - DASH .m4s（推特等）：init 片段 + 同目录同基名的媒体分段按序拼接；
+ * - Range 分块（B 站等）：同一 URL 的分块按 Range 起点排序拼接。
+ */
+export async function stitchEntryBody(
+  id: number,
+  side: 'req' | 'resp' = 'resp',
+): Promise<StitchResult> {
+  try {
+    const resp = await fetch(`/api/entries/${id}/stitch?side=${side}`);
+    if (!resp.ok) {
+      let error = `拼接失败（HTTP ${resp.status}）`;
+      try {
+        const j = await resp.json();
+        if (j?.error) error = j.error;
+      } catch {
+        /* 保留默认错误信息 */
+      }
+      return { ok: false, error };
+    }
+    const buf = await resp.arrayBuffer();
+    return {
+      ok: true,
+      bytes: new Uint8Array(buf),
+      note: resp.headers.get('X-Miniproxy-Stitch'),
+    };
+  } catch {
+    return { ok: false, error: '网络错误，拼接请求失败' };
+  }
+}
+
+/** 从请求头列表里解析 Range 起始字节（bytes=START-END），无 Range 头时返回 null */
+export function rangeStartOf(headers: [string, string][] | null | undefined): number | null {
+  if (!headers) return null;
+  for (const [k, v] of headers) {
+    if (k.toLowerCase() === 'range') {
+      const m = /bytes=(\d+)/.exec(v);
+      if (m) return parseInt(m[1], 10);
+    }
+  }
+  return null;
+}
+
 /** 触发浏览器下载原始字节 */
-export function downloadBytes(bytes: Uint8Array, filename: string): void {
-  const ab = new ArrayBuffer(bytes.byteLength);
+export function downloadBytes(bytes: Uint8Array, filename: string): void {  const ab = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(ab).set(bytes);
   const url = URL.createObjectURL(new Blob([ab], { type: 'application/octet-stream' }));
   const a = document.createElement('a');
