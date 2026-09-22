@@ -6,11 +6,16 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use hyper::Uri;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// 运行期可变的上游配置：界面里随时开关/换地址，无需重启进程。
+pub type SharedUpstream = Arc<RwLock<Option<Upstream>>>;
 
 /// 上游代理地址（暂支持 http://host:port，无认证）。
 #[derive(Clone, Debug)]
@@ -22,20 +27,90 @@ pub struct Upstream {
 impl Upstream {
     pub fn from_env() -> Option<Upstream> {
         let v = std::env::var("MINIPROXY_UPSTREAM_PROXY").ok()?;
-        let v = v.trim().to_string();
-        if v.is_empty() {
+        Upstream::parse(&v)
+    }
+
+    /// 解析 `127.0.0.1:7890` / `http://127.0.0.1:7890`（暂不支持 socks，返回 None）。
+    pub fn parse(v: &str) -> Option<Upstream> {
+        let v = v.trim();
+        if v.is_empty() || v.starts_with("socks") {
             return None;
         }
         let s = v
             .strip_prefix("http://")
             .or_else(|| v.strip_prefix("https://"))
-            .unwrap_or(&v);
+            .unwrap_or(v);
+        let s = s.trim_end_matches('/');
         let (host, port) = crate::util::split_authority(s, 80);
         if host.is_empty() {
             return None;
         }
         Some(Upstream { host, port })
     }
+
+    pub fn addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// 连通性测试：TCP 握手 + 一次 CONNECT 探针，确认对方确实是 HTTP 代理。
+    /// 用于「保存前先验证」，避免填错地址后所有请求失败却不知道原因。
+    pub async fn probe(&self) -> Result<(), String> {
+        let addr = self.addr();
+        let connect = TcpStream::connect((self.host.as_str(), self.port));
+        let mut tcp = match tokio::time::timeout(Duration::from_millis(800), connect).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(format!("无法连接 {}（{}）", addr, e)),
+            Err(_) => return Err(format!("连接 {} 超时（800ms）", addr)),
+        };
+        let req = format!(
+            "CONNECT www.gstatic.com:443 HTTP/1.1\r\nHost: www.gstatic.com:443\r\n\r\n"
+        );
+        if let Err(e) = tcp.write_all(req.as_bytes()).await {
+            return Err(format!("向 {} 发送 CONNECT 失败（{}）", addr, e));
+        }
+        let read = read_connect_response(&mut tcp);
+        match tokio::time::timeout(Duration::from_millis(2500), read).await {
+            Ok(Ok(code)) if (200..300).contains(&code) => Ok(()),
+            Ok(Ok(code)) => Err(format!("{} 不是可用的 HTTP 代理（CONNECT 返回 {}）", addr, code)),
+            Ok(Err(e)) => Err(format!("读取 {} 响应失败（{}）", addr, e)),
+            Err(_) => Err(format!("等待 {} 的 CONNECT 响应超时", addr)),
+        }
+    }
+}
+
+/// 本机常见代理软件的 HTTP 代理端口（按常见程度排序），用于「自动检测」。
+const CANDIDATE_PORTS: [u16; 14] = [
+    7890, 7897, 7891, 9090, 8888, 10809, 6152, 1087, 2080, 2081, 3128, 8889, 8080, 20171,
+];
+
+/// 自动探测本机是否已运行可用的 HTTP 代理（Clash/Charles/Surge/v2ray…）。
+/// 并发探测全部候选端口，返回清单中最靠前的可用项；skip_ports 用于排除本实例端口避免自连成环。
+pub async fn detect_local_upstream(skip_ports: &[u16]) -> Vec<Upstream> {
+    let mut tasks = Vec::new();
+    for port in CANDIDATE_PORTS {
+        if skip_ports.contains(&port) {
+            continue;
+        }
+        let up = Upstream {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        tasks.push(tokio::spawn(async move {
+            match up.probe().await {
+                Ok(()) => Some(up),
+                Err(_) => None,
+            }
+        }));
+    }
+    let mut found: Vec<Upstream> = Vec::new();
+    for t in tasks {
+        if let Ok(Some(up)) = t.await {
+            found.push(up);
+        }
+    }
+    // 按候选清单顺序排列（并发完成顺序不稳定）
+    found.sort_by_key(|u| CANDIDATE_PORTS.iter().position(|p| *p == u.port).unwrap_or(usize::MAX));
+    found
 }
 
 /// 到目标 host:port 的 TCP 连接：有上游则 CONNECT 隧道，否则直连。
@@ -161,7 +236,7 @@ impl AsyncWrite for OriginStream {
 /// hyper 客户端连接器：按 URI scheme 拨号（可选上游级联 + TLS）。
 #[derive(Clone)]
 pub struct ProxyConnector {
-    pub upstream: Option<Upstream>,
+    pub upstream: SharedUpstream,
 }
 
 impl hyper::client::connect::Connection for OriginStream {
@@ -180,7 +255,8 @@ impl hyper::service::Service<Uri> for ProxyConnector {
     }
 
     fn call(&mut self, uri: Uri) -> Self::Future {
-        let upstream = self.upstream.clone();
+        // 每次拨号都读取当前配置：界面里切换上游后，新连接立即生效（已建立的连接不受影响）
+        let upstream = self.upstream.read().ok().and_then(|g| g.clone());
         Box::pin(async move { dial_for_uri(upstream.as_ref(), &uri).await })
     }
 }

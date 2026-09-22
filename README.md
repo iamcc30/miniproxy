@@ -12,6 +12,7 @@
 | 解包能力 | 自动解压 gzip / deflate(zlib+raw) / brotli / zstd；chunked 分片由 HTTP 层自动还原；WebSocket 文本帧还原（支持续帧合并）；**二进制 / 压缩正文自动识别为乱码并提供原始数据视图（文本 / 十六进制 / Base64 + 下载原始字节）** |
 | 可视化界面 | SSE 实时推送、暂停/恢复、明暗主题切换（浅色/深色/跟随系统）、历史记录查看与 JSON/HAR 导出 |
 | 一键系统代理 | 界面右上角一键开启/关闭 macOS 系统代理（HTTP+HTTPS+SOCKS）；开启前自动备份原有代理配置，关闭时恢复，不破坏 Clash 等已有配置；**程序退出时（含 Ctrl+C、强杀、崩溃）自动恢复系统代理**，不会留下指向死端口的代理导致断网 |
+| 上游级联 | 出站流量经本机其他代理（Clash/Charles/Surge…）转发，HTTPS 仍被解密抓包。**三种配置方式**：界面「🔗 上游级联」一键检测/手填（改完立即生效）、环境变量 `MINIPROXY_UPSTREAM_PROXY`、从未配置时**启动自动探测**本机常见代理端口；设置持久化到 `~/.miniproxy/config.json`，启用前自动做连通性测试 |
 
 ## 项目结构
 
@@ -27,6 +28,8 @@ miniproxy/
 │       ├── tcp.rs      # TCP 隧道记录
 │       ├── api.rs      # REST/SSE/导出/静态服务
 │       ├── peek.rs     # 首字节探测流包装
+│       ├── config.rs   # 持久化配置 ~/.miniproxy/config.json（上游级联等）
+│       ├── dial.rs     # 出站拨号：直连 / 上游 CONNECT 级联 / 本机代理自动探测
 │       └── util.rs     # 通用工具
 └── frontend/           # React + Vite + TypeScript
     └── src/            # App.tsx（列表/过滤/详情）、api.ts、theme.ts、styles.css
@@ -46,7 +49,9 @@ cargo run            # 默认代理端口 34567，界面端口 9000
 - `MINIPROXY_API_PORT`（默认 9000）：界面/API 端口
 - `MINIPROXY_STATIC`：前端静态文件目录
 - `MINIPROXY_API_HOST`：界面/API 监听地址（默认 `127.0.0.1`；手机抓包设为 `0.0.0.0` 以便设备下载 CA 证书）
-- `MINIPROXY_UPSTREAM_PROXY`：上游级联代理（如 `http://127.0.0.1:7890`）
+- `MINIPROXY_UPSTREAM_PROXY`：上游级联代理（如 `http://127.0.0.1:7890`；优先级最高，会覆盖界面设置）
+
+其中「上游级联」无需改环境变量：界面右上角「🔗 上游级联」可随时开关/更换，运行期立即生效。
 
 ### 上游级联（抓包 + 科学上网）
 
@@ -54,9 +59,25 @@ cargo run            # 默认代理端口 34567，界面端口 9000
 直连会在 TLS 握手阶段被中断，界面显示 `tls handshake eof` 错误。
 此时可开启「上游级联」，让出站流量经本机其他代理（Clash 等）转发：
 
+1. **界面开启（推荐）**：打开 http://127.0.0.1:9000，点击右上角「🔗 上游级联」
+   → 「🔍 自动检测本机代理」，会并发探测本机常见代理端口
+   （7890 / 7897 / 7891 / 9090 / 8888 / 10809 / 6152 / 1087 / 2080 / 2081 / 3128 / 8889 / 8080 / 20171，
+   覆盖 Clash / Clash Verge / Charles / Surge / v2ray 等），命中一个 CONNECT 探针通过才算可用；
+   点候选地址即可启用，也可手动填 `127.0.0.1:7890`。
+2. **启动时就生效**：环境变量
+
 ```bash
 MINIPROXY_UPSTREAM_PROXY=http://127.0.0.1:7890 cargo run
 ```
+
+3. **完全不用管**：从未配置过上游时，MiniProxy 会在启动后**后台自动探测**本机代理，
+   探测到就直接启用（终端会打印「自动检测到本机代理 … 并已启用」），不阻塞启动、不需要重启。
+
+设置会持久化到 `~/.miniproxy/config.json`，下次启动沿用；一旦在界面里显式关闭，
+就不再自动探测，尊重你的选择。取值优先级：**环境变量 > 界面保存的配置 > 自动探测**。
+
+界面里修改**立即对新连接生效**（无需重启），设置前会先做连通性测试（TCP 握手 + CONNECT 探针），
+地址不通会被拒绝并给出原因，不会让你带着坏配置继续抓包。
 
 开启后：
 - 到所有源站的连接（HTTP/HTTPS/WS/TCP）先经上游代理（HTTP CONNECT 隧道）出站
@@ -146,6 +167,12 @@ sudo security add-trusted-cert -d -r trustRoot \
   都会自动把系统代理恢复为开启前的状态，不会出现「程序已退出、代理仍指向 34567 死端口」导致断网。
   实现为两层：正常退出由信号处理（SIGINT/SIGTERM/SIGHUP）恢复；强杀/崩溃则由一个看门狗
   子进程（`miniproxy --sysproxy-watchdog <父PID>`）检测到父进程消失后按备份恢复。
+  存活判定用**父子间的 socketpair**：父进程无论正常退出、`kill -9` 还是崩溃，其持有的那端都会关闭，
+  子进程读到 EOF 即恢复——不依赖 `ps` 轮询（受限终端 / 沙箱里 `ps` 会执行失败，
+  旧实现会把它误判成「父进程已死」，导致刚开启的系统代理在 1 秒内被自动关掉）。
+- **极端兜底**：若整个进程组被一起杀掉（连看门狗也没能执行），手动执行
+  `networksetup -setwebproxystate Wi-Fi off && networksetup -setsecurewebproxystate Wi-Fi off`
+  即可恢复直连。
 - **手动设置**：设置 HTTP/HTTPS 代理为 `127.0.0.1:34567`
 - **curl**：`curl -x http://127.0.0.1:34567 https://httpbin.org/get`
 - **浏览器**：`chrome --proxy-server=http://127.0.0.1:34567`
@@ -179,11 +206,53 @@ sudo security add-trusted-cert -d -r trustRoot \
 
 打开界面：**http://127.0.0.1:9000**
 
+### 7. 抓不到某个 App 的包？（不使用 macOS 系统代理的客户端）
+
+界面里的「系统代理」只对**走系统网络栈**的客户端生效——浏览器（Chromium/WebKit）、
+微信/企业微信、`curl`、Electron 应用等；而自带 HTTP 栈、不读 macOS 系统代理配置的程序**看不见**：
+
+| 客户端 | 是否读 macOS 系统代理 | 表现 |
+|---|---|---|
+| 浏览器 / Electron / curl | ✅ | 一键系统代理后立刻能抓到 |
+| Rust（reqwest+rustls）/ Go / Java / Node(undici) | ❌ 默认不读 | 界面里只有它的其他流量（或什么都没有） |
+
+**典型案例：Codex（ChatGPT.app 内置的 `codex` 二进制）**
+
+- 验证方法：`codex doctor` → `Connectivity` 段。若出现
+  `system proxy: manual` + `respect system proxy: disabled`，说明它**完全无视**系统代理
+  （对应的特性开关 `respect_system_proxy` 仍是 under development）。
+  此时界面能抓到的只有 App 前端（标注为 `Codex (Service)`）的遥测/RUM 请求，
+  真正的对话请求一条都没有——这不是代理坏了。
+- **正确做法**：这类客户端只认 `HTTP_PROXY / HTTPS_PROXY / ALL_PROXY` 环境变量。
+  Codex 会在启动时读取 `~/.codex/.env`，把它指向 MiniProxy 即可：
+
+  ```bash
+  # ~/.codex/.env
+  HTTP_PROXY="http://127.0.0.1:34567"
+  HTTPS_PROXY="http://127.0.0.1:34567"
+  NO_PROXY="localhost,127.0.0.1,::1"
+  ```
+
+  改完**重启 Codex**（环境变量只在进程启动时读一次，已运行的实例仍走旧配置）。
+  出站照常经「上游级联」转发，所以被墙站点照样能访问，HTTPS 依旧被解密抓包；
+  CA 无需额外配置（codex 的 rustls 走系统原生证书库，信任钥匙串里的 MiniProxy Root CA）。
+- **Codex 的对话不是普通 POST，而是 WebSocket**：
+  `wss://chatgpt.com/backend-api/codex/responses`。在界面里按「协议 → WebSocket」
+  筛选，或搜索 `codex/responses`，提示词与流式回复会以帧为单位记录在详情里。
+- 其他同类客户端同理，例如：给 `openai-python` / `requests` 设 `HTTPS_PROXY`，
+  或给 Gradle/Maven（Java）加 `-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=34567`。
+
 ## 已知限制
 
 - 响应体采用「流式转发 + 边收边存」，单条记录正文最多保留 4 MB（超出部分截断并标记）。
 - 详情面板的原始数据视图（十六进制 / Base64 / 下载）单侧最多回传 256 KB（原始大小照实显示，超出部分标注「视图已截断」）。
-- WebSocket 压缩扩展（permessage-deflate）暂不解压，记录原始帧。
+- WebSocket 不再协商 permessage-deflate 压缩扩展（MITM 转发升级请求时剥掉
+  `Sec-WebSocket-Extensions`），因此抓到的帧始终是明文，无需解压；
+  代价是 WS 流量失去压缩（对抓包场景无所谓）。
+- WebSocket 文本帧**按连接**保留，文本总额度 8 MB（`ws::WS_TEXT_BUDGET`）：额度内
+  逐条完整入库（几十 KB 的 `response.create` 也能整段看），超出后该条只留前缀并标记
+  「内容已截断」。消息头同时显示 **payload 字节数**与**文本字符数**——中文一个字 3 字节，
+  两个数字不同是正常的。
 - 「按应用」分组通过 `lsof` 识别**本机客户端进程**（约 60ms/连接，已缓存；`MINIPROXY_NO_APP=1` 可关闭）。经远程机器转发进来的流量无法识别原始进程，会显示为「未知应用」。
 - HTTP/2 上游以 HTTP/1.1 对接（ALPN 不向上游协商 h2），绝大多数站点兼容。
 - HTTP/1.1 Keep-Alive 多路复用场景下，一条 UI 记录对应一次「请求-响应」往返。

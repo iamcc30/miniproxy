@@ -7,8 +7,14 @@
 //! - 程序退出时自动恢复：
 //!   - 优雅退出（Ctrl+C / SIGTERM / SIGHUP）：主进程捕获信号后调用 disable()；
 //!   - 强杀 / 崩溃（kill -9）：enable 时孵化一个看门狗子进程
-//!     （`miniproxy --sysproxy-watchdog <父进程 PID>`），每秒探测父进程，
-//!     父进程消失即按备份恢复系统代理，防止系统代理指向已死端口断网。
+//!     （`miniproxy --sysproxy-watchdog <父进程 PID>`），父进程消失即按备份恢复系统代理，
+//!     防止系统代理指向已死端口断网。
+//!
+//! 看门狗的存活判定（重要）：曾实现为「每秒 ps -p <pid> 查进程名」，实践中脆弱——
+//! ps 在受限终端 / 沙箱里会执行失败或被拦截，此时 `output()` 返回 Err，被当成“父进程已死”，
+//! 于是刚开启的系统代理在 1 秒内就被误恢复掉。现改为父子各持 socketpair 一端：
+//! 父进程无论正常退出、被 kill -9 还是崩溃，其所有 fd 都会关闭，子进程读到 EOF 即为父进程消失。
+//! 这条路径完全不依赖外部命令，也不会因 PID 复用误判。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -20,6 +26,9 @@ static SYS_PROXY_ON: AtomicBool = AtomicBool::new(false);
 
 /// 看门狗子进程句柄（None 表示未孵化或已退出）。
 static WATCHDOG: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+/// socketpair 的父进程端：必须长期持有，一旦关闭（含进程退出）子进程就会读到 EOF。
+static WATCHDOG_LINK: Mutex<Option<std::os::unix::net::UnixStream>> = Mutex::new(None);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ServiceState {
@@ -57,21 +66,43 @@ fn spawn_watchdog() {
         Ok(e) => e,
         Err(_) => return,
     };
+
+    // 父子各持 socketpair 一端：父进程消失（正常退出 / kill -9 / 崩溃）时，
+    // 它持有的那端随之关闭，子进程读到 EOF。相比 ps 轮询，不受命令可用性影响。
+    let (parent_end, child_end) = match std::os::unix::net::UnixStream::pair() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("创建看门狗管道失败: {}", e);
+            return;
+        }
+    };
+
+    let child_io = std::process::Stdio::from(std::os::fd::OwnedFd::from(child_end));
     let child = std::process::Command::new(exe)
         .arg("--sysproxy-watchdog")
         .arg(std::process::id().to_string())
-        .stdin(std::process::Stdio::null())
+        .stdin(child_io)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
     match child {
-        Ok(c) => *g = Some(c),
+        Ok(c) => {
+            // 父端必须一直保存在 static 里；drop 掉会让子进程立刻看到 EOF 从而误恢复
+            if let Ok(mut link) = WATCHDOG_LINK.lock() {
+                *link = Some(parent_end);
+            }
+            *g = Some(c);
+        }
         Err(e) => eprintln!("孵化系统代理看门狗失败: {}", e),
     }
 }
 
 /// 终止看门狗子进程（正常关闭系统代理或优雅退出时调用）。
 fn stop_watchdog() {
+    // 先关闭父端：即使 kill 失败，子进程也会因读到 EOF 而自行退出
+    if let Ok(mut link) = WATCHDOG_LINK.lock() {
+        *link = None;
+    }
     let mut g = WATCHDOG.lock().unwrap();
     if let Some(mut child) = g.take() {
         let _ = child.kill();
@@ -79,24 +110,23 @@ fn stop_watchdog() {
     }
 }
 
-/// 看门狗主循环：每秒探测父进程是否存活，消失后按备份恢复系统代理并退出。
-/// 通过 `ps -p <pid> -o comm=` 检查（进程名含 miniproxy），同时规避 PID 复用误判。
-pub fn watchdog_run(parent_pid: &str) {
+/// 看门狗主循环：阻塞读父进程持有的 socketpair 端，读到 EOF 即父进程消失，按备份恢复后退出。
+pub fn watchdog_run(_parent_pid: &str) {
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 64];
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let alive = std::process::Command::new("ps")
-            .args(["-p", parent_pid, "-o", "comm="])
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .to_lowercase()
-                    .contains("miniproxy")
-            })
-            .unwrap_or(false);
-        if !alive {
-            let _ = disable();
-            std::process::exit(0);
+        match std::io::Read::read(&mut stdin, &mut buf) {
+            Ok(0) => break, // EOF：父进程已退出/被杀/崩溃，它的 fd 都关了
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
+    }
+    // EOF 已足以判定父进程消失（只有它持有另一端），直接恢复，不再用 ps 二次确认，
+    // 避免像旧实现那样因 ps 不可用而误判。
+    match disable() {
+        Ok(()) => println!("[miniproxy] 主进程已退出，系统代理已恢复为开启前的状态"),
+        Err(e) => eprintln!("[miniproxy] 主进程已退出，但恢复系统代理失败: {}", e),
     }
 }
 

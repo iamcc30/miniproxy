@@ -7,7 +7,6 @@ use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::{Body, Method, Request, Response};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::capture::{self, ClientInfo, Entry, Store};
 use crate::dial;
@@ -119,7 +118,9 @@ async fn handle_tunnel(
                     client,
                 );
                 app.store.push(entry.clone());
-                match dial::tcp_dial(app.upstream.as_ref(), host.as_str(), port).await {
+                // 隧道类连接：读取当前生效的上游配置（界面里改了立即对新连接生效）
+                let upstream = app.upstream();
+                match dial::tcp_dial(upstream.as_ref(), host.as_str(), port).await {
                     Ok(remote) => crate::tcp::splice_tcp(peeked, remote, entry).await,
                     Err(e) => finish_err(&entry, &app.store, format!("连接目标失败: {}", e)),
                 }
@@ -139,7 +140,8 @@ async fn handle_tunnel(
             client,
         );
         app.store.push(entry.clone());
-        match dial::tcp_dial(app.upstream.as_ref(), host.as_str(), port).await {
+        let upstream = app.upstream();
+        match dial::tcp_dial(upstream.as_ref(), host.as_str(), port).await {
             Ok(remote) => crate::tcp::splice_tcp(peeked, remote, entry).await,
             Err(e) => finish_err(&entry, &app.store, format!("连接目标失败: {}", e)),
         }
@@ -255,7 +257,13 @@ pub async fn handle_ws_upgrade(
     let mut req_bytes = format!("{} {} HTTP/1.1\r\n", method, path).into_bytes();
     for (k, v) in util::header_pairs(&headers) {
         let kl = k.to_lowercase();
-        if matches!(kl.as_str(), "proxy-connection" | "transfer-encoding" | "te") {
+        if matches!(
+            kl.as_str(),
+            "proxy-connection" | "transfer-encoding" | "te"
+                // 剥掉 permessage-deflate 协商：否则源站把帧 payload 全部
+                // deflate 压缩，帧解析器拿到的是压缩字节，抓包内容全是乱码。
+                | "sec-websocket-extensions"
+        ) {
             continue;
         }
         req_bytes.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
@@ -270,17 +278,36 @@ pub async fn handle_ws_upgrade(
 
     // 在返回 101 之前先连接源站并拿到其响应头：
     // 这样客户端只会收到一个 101（携带真实的 Sec-WebSocket-Accept）。
+    // 出站必须和普通请求一样尊重「上游级联」配置：否则被墙站点的 WS
+    // 升级会直连源站，表现为客户端握手一直挂到超时。
+    let upstream_cfg = app.upstream();
     let upstream_result = async {
-        let mut upstream = connect_origin(&ohost, oport, tls).await?;
-        upstream.write_all(&req_bytes).await.map_err(|e| format!("向源站发送升级请求失败: {}", e))?;
-        let head = read_http_head(&mut upstream)
+        let mut origin: Box<dyn DynStream> = {
+            let tcp = dial::tcp_dial(upstream_cfg.as_ref(), &ohost, oport)
+                .await
+                .map_err(|e| format!("连接源站失败: {}", e))?;
+            if tls {
+                Box::new(
+                    dial::tls_wrap(&ohost, tcp)
+                        .await
+                        .map_err(|e| format!("TLS 连接源站失败: {}", e))?,
+                )
+            } else {
+                Box::new(tcp)
+            }
+        };
+        origin
+            .write_all(&req_bytes)
+            .await
+            .map_err(|e| format!("向源站发送升级请求失败: {}", e))?;
+        let head = read_http_head(&mut origin)
             .await
             .map_err(|e| format!("读取源站升级响应失败: {}", e))?;
-        Ok::<_, String>((upstream, head))
+        Ok::<_, String>((origin, head))
     }
     .await;
 
-    let (mut upstream, head) = match upstream_result {
+    let (upstream, head) = match upstream_result {
         Ok(v) => v,
         Err(e) => {
             finish_err(&entry, &app.store, e);
@@ -343,36 +370,6 @@ pub async fn handle_ws_upgrade(
 
 pub trait DynStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DynStream for T {}
-
-/// 连接源站（可选 TLS）。
-async fn connect_origin(
-    host: &str,
-    port: u16,
-    tls: bool,
-) -> Result<Box<dyn DynStream>, String> {
-    let tcp = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| format!("连接源站失败: {}", e))?;
-    if !tls {
-        return Ok(Box::new(tcp));
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().map_err(|e| e.to_string())? {
-        let _ = roots.add(&rustls::Certificate(cert.0));
-    }
-    let cfg = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-    let name =
-        rustls::ServerName::try_from(host.to_string().as_str()).map_err(|e| e.to_string())?;
-    let stream = connector
-        .connect(name, tcp)
-        .await
-        .map_err(|e| format!("TLS 连接源站失败: {}", e))?;
-    Ok(Box::new(stream))
-}
 
 /// 逐字节读取直到出现空行（HTTP 头结束）。
 async fn read_http_head<S: AsyncRead + Unpin>(io: &mut S) -> std::io::Result<Vec<u8>> {

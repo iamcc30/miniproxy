@@ -14,6 +14,7 @@ mod api;
 mod attrib;
 mod ca;
 mod capture;
+mod config;
 mod dial;
 mod peek;
 mod proxy;
@@ -37,7 +38,10 @@ pub struct App {
     pub proxy_port: u16,
     pub api_port: u16,
     pub lan_ip: Option<String>,
-    pub upstream: Option<dial::Upstream>,
+    /// 上游级联配置，运行期可在界面里修改（无需重启）
+    pub upstream: dial::SharedUpstream,
+    /// 当前上游来源：env / saved / auto / manual / off
+    pub upstream_source: std::sync::Mutex<String>,
     /// 各域名 TLS 握手失败计数：达到阈值（proxy::AUTO_BYPASS_THRESHOLD）后自动直通，
     /// 让证书固定（pinning）的 App 在代理下照常工作。
     pub bypass_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
@@ -56,6 +60,40 @@ impl App {
     pub fn clear_tls_failure(&self, host: &str) {
         let mut m = self.bypass_counts.lock().unwrap();
         m.remove(&host.to_lowercase());
+    }
+
+    /// 当前生效的上游代理（None = 直连）。
+    pub fn upstream(&self) -> Option<dial::Upstream> {
+        self.upstream.read().ok().and_then(|g| g.clone())
+    }
+
+    /// 切换上游代理，并记录来源（下一次拨号起生效）。
+    pub fn set_upstream(&self, up: Option<dial::Upstream>, source: &str) {
+        if let Ok(mut g) = self.upstream.write() {
+            *g = up;
+        }
+        if let Ok(mut s) = self.upstream_source.lock() {
+            *s = source.to_string();
+        }
+    }
+
+    pub fn upstream_source(&self) -> String {
+        self.upstream_source
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    /// 把上游设置持久化到 ~/.miniproxy/config.json，下次启动沿用。
+    pub fn save_upstream_config(&self) {
+        let up = self.upstream();
+        let cfg = config::Config {
+            upstream_enabled: Some(up.is_some()),
+            upstream_addr: up.as_ref().map(|u| u.addr()),
+        };
+        if let Err(e) = config::save(&cfg) {
+            eprintln!("  保存上游配置失败: {}", e);
+        }
     }
 }
 
@@ -143,12 +181,12 @@ async fn main() {
     let proxy_port = env_or("MINIPROXY_PORT", 34567);
     let api_port = env_or("MINIPROXY_API_PORT", 9000);
     let api_host = std::env::var("MINIPROXY_API_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let upstream = dial::Upstream::from_env();
+    let upstream = resolve_upstream();
     let lan_ip = detect_lan_ip();
 
     let store = Arc::new(Store::new(5000));
     let ca = Arc::new(ca::Ca::load_or_create().expect("初始化本地 CA 失败"));
-    let client = build_http_client(upstream.clone());
+    let client = build_http_client(upstream.shared.clone());
 
     println!("==============================================");
     println!("  MiniProxy 抓包代理");
@@ -162,9 +200,17 @@ async fn main() {
         }
     }
     println!("                  (浏览器/系统需信任该证书才能解密 HTTPS)");
-    match &upstream {
-        Some(up) => println!("  上游级联      : {}:{}  (出站流量经此代理转发)", up.host, up.port),
-        None => println!("  上游级联      : 未启用 (设 MINIPROXY_UPSTREAM_PROXY=http://host:port 开启)"),
+    match &upstream.initial {
+        Some(up) => println!(
+            "  上游级联      : {}:{}  (来源: {})，出站流量经此代理转发",
+            up.host, up.port, source_label(&upstream.source)
+        ),
+        None if upstream.source == "auto-pending" => {
+            println!("  上游级联      : 正在后台探测本机代理…（探测到会自动启用，见下方提示）")
+        }
+        None => println!(
+            "  上游级联      : 未启用（界面「上游级联」可一键检测开启，或设 MINIPROXY_UPSTREAM_PROXY）"
+        ),
     }
     println!("==============================================");
 
@@ -175,7 +221,8 @@ async fn main() {
         proxy_port,
         api_port,
         lan_ip,
-        upstream,
+        upstream: upstream.shared.clone(),
+        upstream_source: std::sync::Mutex::new(upstream.source.clone()),
         bypass_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
@@ -243,6 +290,23 @@ async fn main() {
         });
     }
 
+    // 从未配置过上游时：后台探测本机常见代理端口（Clash/Charles/Surge/v2ray…），
+    // 探测到即自动启用。放后台任务里做，避免拖慢启动、也不阻塞端口监听。
+    if upstream.initial.is_none() && upstream.source == "auto-pending" {
+        let auto_app = app.clone();
+        tokio::spawn(async move {
+            let found = dial::detect_local_upstream(&[proxy_port, api_port]).await;
+            if let Some(up) = found.into_iter().next() {
+                println!(
+                    "\n  上游级联      : 自动检测到本机代理 {}:{} 并已启用（界面「上游级联」可关闭或更换）",
+                    up.host, up.port
+                );
+                auto_app.set_upstream(Some(up), "auto");
+                auto_app.save_upstream_config();
+            }
+        });
+    }
+
     // 等待退出信号：Ctrl+C (SIGINT) / SIGTERM / SIGHUP（终端关闭）
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("注册 SIGTERM 失败");
@@ -265,7 +329,49 @@ async fn main() {
     println!("MiniProxy 已退出。");
 }
 
-fn build_http_client(upstream: Option<dial::Upstream>) -> HttpClient {
+fn build_http_client(upstream: dial::SharedUpstream) -> HttpClient {
     let connector = dial::ProxyConnector { upstream };
     Client::builder().build(connector)
+}
+
+/// 启动时的初始上游配置（决定于环境变量 / 界面保存的配置）。
+struct UpstreamInit {
+    initial: Option<dial::Upstream>,
+    shared: dial::SharedUpstream,
+    /// env（环境变量）/ saved（界面保存）/ off（用户关闭过）/ auto-pending（未配置，待自动探测）
+    source: String,
+}
+
+/// 上游级联的取值优先级：环境变量 > 界面保存的配置 >（未配置时）后台自动探测。
+fn resolve_upstream() -> UpstreamInit {
+    let cfg = config::load();
+    let (initial, source) = if let Some(up) = dial::Upstream::from_env() {
+        (Some(up), "env")
+    } else if cfg.upstream_enabled == Some(true) {
+        let up = cfg.upstream_addr.as_deref().and_then(dial::Upstream::parse);
+        if up.is_none() {
+            eprintln!("提示：已保存的上游地址无效，本次回退为直连，请在界面重新设置。");
+        }
+        (up, "saved")
+    } else if cfg.upstream_enabled == Some(false) {
+        // 用户显式关闭过，尊重选择，不再自动探测
+        (None, "off")
+    } else {
+        (None, "auto-pending")
+    };
+    UpstreamInit {
+        shared: std::sync::Arc::new(std::sync::RwLock::new(initial.clone())),
+        initial,
+        source: source.to_string(),
+    }
+}
+
+fn source_label(source: &str) -> &'static str {
+    match source {
+        "env" => "环境变量 MINIPROXY_UPSTREAM_PROXY",
+        "saved" => "上次在界面中保存",
+        "auto" => "启动时自动检测",
+        "manual" => "界面手动设置",
+        _ => "当前配置",
+    }
 }
