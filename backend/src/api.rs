@@ -45,6 +45,9 @@ pub async fn handle_api(
         (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/fullvideo") => {
             return Ok(entry_fullvideo(req, app.clone(), p).await)
         }
+        (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/fullmux") => {
+            return Ok(entry_fullmux(req, app.clone(), p).await)
+        }
         (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/body") => {
             entry_body(req, &app, p)
         }
@@ -570,6 +573,111 @@ fn format_bytes_cap(n: usize) -> String {
 ///   顺序下载全部分段并拼接，TS / fMP4 自动识别；
 /// - 普通媒体（video/audio）：整文件重新 GET，流式转发，不受 4 MB 存储上限影响。
 /// 浏览器以附件形式下载。
+/// 从抓包请求头里取 UA / Referer（源站重拉时复用，绕常见防盗链）
+fn entry_ua_referer(e: &crate::capture::Entry) -> (Option<String>, Option<String>) {
+    let mut ua = None;
+    let mut referer = None;
+    for (k, v) in &e.req_headers {
+        let kl = k.to_lowercase();
+        if kl == "user-agent" {
+            ua = Some(v.clone());
+        } else if kl == "referer" {
+            referer = Some(v.clone());
+        }
+    }
+    (ua, referer)
+}
+
+/// 解析 m3u8：主 playlist 选 BANDWIDTH 最高变体，收集 init + 分段。
+/// 返回 (有序下载链 [init?]+segs, 是否 fMP4, 实际使用的 playlist URL)。
+async fn hls_chain(
+    app: &App,
+    url: &str,
+    ua: Option<&str>,
+    referer: Option<&str>,
+) -> Result<(Vec<String>, bool, String), String> {
+    let playlist = fetch_body_vec(app, url, ua, referer, HLS_PLAYLIST_CAP)
+        .await
+        .map_err(|e| format!("获取 m3u8 失败: {}", e))?;
+    let mut playlist_url = url.to_string();
+    let mut pl_text = String::from_utf8_lossy(&playlist).to_string();
+
+    // 主 playlist：选 BANDWIDTH 最高的变体再取一级
+    if pl_text.contains("#EXT-X-STREAM-INF") {
+        let lines: Vec<&str> = pl_text.lines().collect();
+        let mut best: Option<(u64, String)> = None;
+        let mut i = 0;
+        while i < lines.len() {
+            if let Some(line) = lines[i].strip_prefix("#EXT-X-STREAM-INF") {
+                let bw = line
+                    .split(',')
+                    .find_map(|kv| {
+                        let kv = kv.trim().trim_start_matches(':');
+                        let mut it = kv.split('=');
+                        let k = it.next()?.trim().to_ascii_uppercase();
+                        if k == "BANDWIDTH" {
+                            it.next()?.trim().parse::<u64>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if let Some(uri) = lines[i + 1..].iter().find(|l| !l.trim().starts_with('#')) {
+                    let full = resolve_url(&playlist_url, uri.trim());
+                    if best.as_ref().map(|(b, _)| bw > *b).unwrap_or(true) {
+                        best = Some((bw, full));
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        match best {
+            Some((_, variant_url)) => {
+                playlist_url = variant_url;
+                let t = fetch_body_vec(app, &playlist_url, ua, referer, HLS_PLAYLIST_CAP)
+                    .await
+                    .map_err(|e| format!("获取子 m3u8 失败: {}", e))?;
+                pl_text = String::from_utf8_lossy(&t).to_string();
+            }
+            None => return Err("m3u8 里没有可用的播放地址".to_string()),
+        }
+    }
+
+    let mut init_uri: Option<String> = None;
+    let mut segs: Vec<String> = Vec::new();
+    for line in pl_text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXT-X-MAP") {
+            if let Some(p) = rest.split("URI=\"").nth(1) {
+                if let Some(q) = p.find('"') {
+                    init_uri = Some(resolve_url(&playlist_url, &p[..q]));
+                }
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            segs.push(resolve_url(&playlist_url, line));
+        }
+    }
+    if segs.is_empty() {
+        return Err("m3u8 里没有找到视频分段".to_string());
+    }
+    if segs.len() > HLS_MAX_SEGMENTS {
+        segs.truncate(HLS_MAX_SEGMENTS);
+    }
+    let first_path = url_path(&segs[0]).to_lowercase();
+    let is_mp4 = init_uri.is_some()
+        || first_path.ends_with(".m4s")
+        || first_path.ends_with(".mp4")
+        || first_path.contains(".m4s?");
+    let mut chain = Vec::new();
+    if let Some(init) = init_uri {
+        chain.push(init);
+    }
+    chain.extend(segs);
+    Ok((chain, is_mp4, playlist_url))
+}
+
 async fn entry_fullvideo(req: Request<Body>, app: Arc<App>, path: &str) -> Response<Body> {
     let _ = req;
     let rest = path.trim_start_matches("/api/entries/");
@@ -647,113 +755,19 @@ async fn entry_fullvideo(req: Request<Body>, app: Arc<App>, path: &str) -> Respo
             .unwrap();
     }
 
-    // ---- HLS：解析 playlist ----
-    let playlist = match fetch_body_vec(
-        &app,
-        &url,
-        ua.as_deref(),
-        referer.as_deref(),
-        HLS_PLAYLIST_CAP,
-    )
-    .await
-    {
-        Ok(t) => String::from_utf8_lossy(&t).to_string(),
-        Err(e) => return json_error(StatusCode::BAD_GATEWAY, &format!("获取 m3u8 失败: {}", e)),
-    };
-
-    let mut playlist_url = url.clone();
-    let mut pl_text = playlist;
-
-    // 主 playlist：选 BANDWIDTH 最高的变体再取一级
-    if pl_text.contains("#EXT-X-STREAM-INF") {
-        let lines: Vec<&str> = pl_text.lines().collect();
-        let mut best: Option<(u64, String)> = None;
-        let mut i = 0;
-        while i < lines.len() {
-            if let Some(line) = lines[i].strip_prefix("#EXT-X-STREAM-INF") {
-                let bw = line
-                    .split(',')
-                    .find_map(|kv| {
-                        let kv = kv.trim().trim_start_matches(':');
-                        let mut it = kv.split('=');
-                        let k = it.next()?.trim().to_ascii_uppercase();
-                        if k == "BANDWIDTH" {
-                            it.next()?.trim().parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                if let Some(uri) = lines[i + 1..].iter().find(|l| !l.trim().starts_with('#')) {
-                    let full = resolve_url(&playlist_url, uri.trim());
-                    if best.as_ref().map(|(b, _)| bw > *b).unwrap_or(true) {
-                        best = Some((bw, full));
-                    }
-                }
-                i += 2;
+    // ---- HLS：解析 playlist（选最高码率变体 + EXT-X-MAP init）----
+    let (chain, is_mp4, playlist_url) = match hls_chain(&app, &url, ua.as_deref(), referer.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => {
+            let code = if e.contains("没有") {
+                StatusCode::UNPROCESSABLE_ENTITY
             } else {
-                i += 1;
-            }
+                StatusCode::BAD_GATEWAY
+            };
+            return json_error(code, &e);
         }
-        match best {
-            Some((_, variant_url)) => {
-                playlist_url = variant_url;
-                match fetch_body_vec(
-                    &app,
-                    &playlist_url,
-                    ua.as_deref(),
-                    referer.as_deref(),
-                    HLS_PLAYLIST_CAP,
-                )
-                .await
-                {
-                    Ok(t) => pl_text = String::from_utf8_lossy(&t).to_string(),
-                    Err(e) => {
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("获取子 m3u8 失败: {}", e),
-                        )
-                    }
-                }
-            }
-            None => {
-                return json_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "m3u8 里没有可用的播放地址",
-                )
-            }
-        }
-    }
-
-    // 收集 init + 分段
-    let mut init_uri: Option<String> = None;
-    let mut segs: Vec<String> = Vec::new();
-    for line in pl_text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("#EXT-X-MAP") {
-            if let Some(p) = rest.split("URI=\"").nth(1) {
-                if let Some(q) = p.find('"') {
-                    init_uri = Some(resolve_url(&playlist_url, &p[..q]));
-                }
-            }
-        } else if !line.is_empty() && !line.starts_with('#') {
-            segs.push(resolve_url(&playlist_url, line));
-        }
-    }
-    if segs.is_empty() {
-        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "m3u8 里没有找到视频分段");
-    }
-    let total_hint = segs.len();
-    if segs.len() > HLS_MAX_SEGMENTS {
-        segs.truncate(HLS_MAX_SEGMENTS);
-    }
-
-    // 容器类型：有 init 或分段是 .m4s/.mp4 → fMP4；否则 TS
-    let first_path = url_path(&segs[0]).to_lowercase();
-    let is_mp4 = init_uri.is_some()
-        || first_path.ends_with(".m4s")
-        || first_path.ends_with(".mp4")
-        || first_path.contains(".m4s?");
+    };
+    let total_hint = chain.len();
     let out_ct = if is_mp4 { "video/mp4" } else { "video/mp2t" };
     let out_ext = if is_mp4 { "mp4" } else { "ts" };
 
@@ -768,11 +782,6 @@ async fn entry_fullvideo(req: Request<Body>, app: Arc<App>, path: &str) -> Respo
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut total = 0usize;
-        let mut chain: Vec<String> = Vec::new();
-        if let Some(init) = init_uri {
-            chain.push(init);
-        }
-        chain.extend(segs);
         for u in chain {
             if total > HLS_MAX_TOTAL {
                 break;
@@ -806,6 +815,213 @@ async fn entry_fullvideo(req: Request<Body>, app: Arc<App>, path: &str) -> Respo
             format!("attachment; filename=\"{}\"", filename),
         )
         .header("X-Miniproxy-Segments", format!("{}", total_hint))
+        .body(Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+        .unwrap()
+}
+
+/// 探测 ffmpeg 可执行文件路径（常见 Homebrew 位置 + PATH）
+fn find_ffmpeg() -> Option<std::path::PathBuf> {
+    for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+        if std::path::Path::new(p).exists() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let pb = dir.join("ffmpeg");
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+    }
+    None
+}
+
+/// 把某条目对应的源站内容完整下载到文件（直接媒体流式写；m3u8 逐段追加）。
+async fn save_track_to_file(
+    app: &App,
+    entry: &std::sync::Arc<crate::capture::Entry>,
+    out: &std::path::Path,
+) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let (url, content_type) = {
+        let inner = entry.inner.lock().unwrap();
+        (entry.url.clone(), inner.content_type.clone())
+    };
+    let (ua, referer) = entry_ua_referer(entry);
+    let is_hls = url_path(&url).ends_with(".m3u8")
+        || content_type
+            .as_deref()
+            .map(|c| c.to_lowercase().contains("mpegurl"))
+            .unwrap_or(false);
+
+    let mut f = tokio::fs::File::create(out)
+        .await
+        .map_err(|e| format!("创建临时文件失败: {}", e))?;
+    let mut total = 0u64;
+    if is_hls {
+        let (chain, _, _) = hls_chain(app, &url, ua.as_deref(), referer.as_deref()).await?;
+        for u in chain {
+            if total > HLS_MAX_TOTAL as u64 {
+                break;
+            }
+            let b = fetch_body_vec(app, &u, ua.as_deref(), referer.as_deref(), HLS_SEGMENT_CAP)
+                .await?;
+            total += b.len() as u64;
+            f.write_all(&b).await.map_err(|e| e.to_string())?;
+        }
+    } else {
+        let resp = fetch_via_client(app, &url, ua.as_deref(), referer.as_deref())
+            .await
+            .map_err(|e| e)?;
+        let (parts, mut body) = resp.into_parts();
+        if !parts.status.is_success() {
+            return Err(format!("源站返回 HTTP {}", parts.status));
+        }
+        while let Some(chunk) = hyper::body::HttpBody::data(&mut body).await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            total += chunk.len() as u64;
+            f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        }
+    }
+    f.flush().await.map_err(|e| e.to_string())?;
+    Ok(total)
+}
+
+/// 音视频合并端点：`GET /api/entries/:id/fullmux?a=<audioEntryId>`。
+/// 把视频轨与音频轨各自从源站完整拉取到临时文件，ffmpeg -c copy 合并后回传。
+/// 需要系统安装 ffmpeg；未安装时返回 501，前端回退为分开下载。
+async fn entry_fullmux(req: Request<Body>, app: Arc<App>, path: &str) -> Response<Body> {
+    let _ = req;
+    let rest = path.trim_start_matches("/api/entries/");
+    let vid = rest
+        .split('?')
+        .next()
+        .and_then(|s| s.strip_suffix("/fullmux"))
+        .and_then(|s| s.parse::<u64>().ok());
+    let aid = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find_map(|kv| {
+                kv.strip_prefix("a=").and_then(|v| v.parse::<u64>().ok())
+            })
+        });
+    let (Some(vid), Some(aid)) = (vid, aid) else {
+        return not_found();
+    };
+    let Some(ffmpeg) = find_ffmpeg() else {
+        return json_error(StatusCode::NOT_IMPLEMENTED, "未找到 ffmpeg，无法合并音视频");
+    };
+    let video_entry = match app.store.find(vid) {
+        Some(e) => e,
+        None => return not_found(),
+    };
+    let audio_entry = match app.store.find(aid) {
+        Some(e) => e,
+        None => return not_found(),
+    };
+
+    let dir = std::env::temp_dir().join(format!("miniproxy-mux-{}-{}", std::process::id(), vid));
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("创建临时目录失败: {}", e));
+    }
+    let vfile = dir.join("video.m4s");
+    let afile = dir.join("audio.m4s");
+    let ofile = dir.join("out.mp4");
+
+    let cleanup = |dir: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    if let Err(e) = save_track_to_file(&app, &video_entry, &vfile).await {
+        cleanup(&dir);
+        return json_error(StatusCode::BAD_GATEWAY, &format!("拉取视频轨失败: {}", e));
+    }
+    if let Err(e) = save_track_to_file(&app, &audio_entry, &afile).await {
+        cleanup(&dir);
+        return json_error(StatusCode::BAD_GATEWAY, &format!("拉取音频轨失败: {}", e));
+    }
+
+    let status = tokio::process::Command::new(&ffmpeg)
+        .arg("-y")
+        .arg("-i")
+        .arg(&vfile)
+        .arg("-i")
+        .arg(&afile)
+        .args(["-c", "copy", "-movflags", "+faststart"])
+        .arg(&ofile)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            cleanup(&dir);
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("ffmpeg 合并失败（exit {}），轨道格式可能不受支持", s),
+            );
+        }
+        Err(e) => {
+            cleanup(&dir);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("启动 ffmpeg 失败: {}", e));
+        }
+    }
+
+    // 输出文件名：视频轨名去后缀 + .mp4
+    let mut name = safe_download_name(&video_entry);
+    if let Some((stem, _)) = name.rsplit_once('.') {
+        name = format!("{}.mp4", stem);
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let ofile2 = ofile.clone();
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        match std::fs::File::open(&ofile2) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx
+                                .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.blocking_send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir2);
+    });
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", name),
+        )
         .body(Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -963,26 +1179,31 @@ fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
         }
         out
     }
-    for (t, payload) in boxes(b) {
-        if t != b"moov" {
-            continue;
-        }
-        let mut best: Option<(u64, u32, u32)> = None;
-        for (ct, p) in boxes(payload) {
-            if ct == b"tkhd" && p.len() >= 8 {
-                // width/height 固定在 tkhd 末尾 8 字节
-                let w = u32::from_be_bytes(p[p.len() - 8..p.len() - 4].try_into().unwrap()) >> 16;
-                let h = u32::from_be_bytes(p[p.len() - 4..].try_into().unwrap()) >> 16;
-                if w > 0 && h > 0 && best.as_ref().map(|(a, _, _)| w as u64 * h as u64 > *a).unwrap_or(true) {
-                    best = Some((w as u64 * h as u64, w, h));
-                }
+    // tkhd 嵌在 moov → trak → tkhd（也可能更深），递归整棵 box 树查找；
+    // 多轨道时取像素面积最大的那个
+    fn find_tkhds(b: &[u8], out: &mut Vec<Vec<u8>>) {
+        for (t, payload) in boxes(b) {
+            if t == b"tkhd" {
+                out.push(payload.to_vec());
             }
-        }
-        if let Some((_, w, h)) = best {
-            return Some((w, h));
+            // 容器盒继续下钻（moov/trak/edts 等）；tkhd/mdat 等叶子不用
+            find_tkhds(payload, out);
         }
     }
-    None
+    let mut tkhds = Vec::new();
+    find_tkhds(b, &mut tkhds);
+    let mut best: Option<(u64, u32, u32)> = None;
+    for p in tkhds {
+        if p.len() >= 8 {
+            // width/height 固定在 tkhd 末尾 8 字节
+            let w = u32::from_be_bytes(p[p.len() - 8..p.len() - 4].try_into().unwrap()) >> 16;
+            let h = u32::from_be_bytes(p[p.len() - 4..].try_into().unwrap()) >> 16;
+            if w > 0 && h > 0 && best.as_ref().map(|(a, _, _)| w as u64 * h as u64 > *a).unwrap_or(true) {
+                best = Some((w as u64 * h as u64, w, h));
+            }
+        }
+    }
+    best.map(|(_, w, h)| (w, h))
 }
 
 /// URL 路径（去 query）的小写扩展名
@@ -1236,6 +1457,8 @@ fn list_videos(app: &App) -> Response<Body> {
         total_len: Option<u64>,
         /// 组内成员自身是完整 MP4（ftyp+moov+mdat）时，从它解析的分辨率（优先于 init）
         self_res: Option<(u32, u32)>,
+        /// 组内存在完整 fMP4 成员（自带 moov，无需独立 init 也能整文件重拉）
+        has_complete: bool,
     }
     let mut dash: BTreeMap<(String, String, String), DashGroup> = BTreeMap::new();
     let mut inits: Vec<(String, String, String, Vec<u8>)> = Vec::new(); // (host, dir, base, body)
@@ -1268,6 +1491,7 @@ fn list_videos(app: &App) -> Response<Body> {
                 urls: Vec::new(),
                 total_len: None,
                 self_res: None,
+                has_complete: false,
             });
             g.size += s.size;
             g.segments += 1;
@@ -1281,9 +1505,10 @@ fn list_videos(app: &App) -> Response<Body> {
                 }
             }
             // 成员自身是完整 MP4（ftyp+moov+mdat）→ 用它自己的 moov 解析分辨率
-            if g.self_res.is_none() {
-                if let Some(body) = &s.body {
-                    if first_box_type(body) == Some(b"ftyp") && has_mdat_box(body) {
+            if let Some(body) = &s.body {
+                if first_box_type(body) == Some(b"ftyp") && has_mdat_box(body) {
+                    g.has_complete = true;
+                    if g.self_res.is_none() {
                         g.self_res = mp4_resolution(body);
                     }
                 }
@@ -1370,8 +1595,28 @@ fn list_videos(app: &App) -> Response<Body> {
     }
 
     // DASH 组收进结果（须 init 齐全；Range 分块组用 Content-Range 总长做精确大小）
+    let mux_available = find_ffmpeg().is_some();
+    struct DashOut {
+        entry_id: u64,
+        name: String,
+        host: String,
+        url: String,
+        size: u64,
+        size_exact: bool,
+        resolution: Option<String>,
+        segments: usize,
+        range_group: bool,
+        /// 有分辨率 = 视频轨；无 = 音频轨
+        is_video: bool,
+        /// 配对成功后的音频轨 entryId；0 = 自己是被配走的音频轨（不再单独输出）
+        audio_entry_id: Option<u64>,
+    }
+    let mut dash_items: Vec<DashOut> = Vec::new();
     for ((_, _, base), g) in dash {
-        let Some(_) = g.init_body else { continue };
+        // 有独立 init 或组内自带完整 moov 均可（B 站 m4s 自带 moov，无需 init）
+        if g.init_body.is_none() && !g.has_complete {
+            continue;
+        }
         let range_group = g.urls.len() <= 1; // 所有分段同一 URL = Range 分块组
         let init_res = g.init_body.as_deref().and_then(mp4_resolution);
         let resolution = g
@@ -1380,27 +1625,79 @@ fn list_videos(app: &App) -> Response<Body> {
             .map(|(w, h)| format!("{}x{}", w, h));
         let (size, exact) = if range_group {
             match g.total_len {
-                Some(t) => (Some(t), true),
-                None => (Some(g.size), false),
+                Some(t) => (t, true),
+                None => (g.size, false),
             }
         } else {
-            (Some(g.size), false) // 分段文件组只能按已捕获合计估算
+            (g.size, false) // 分段文件组只能按已捕获合计估算
         };
+        dash_items.push(DashOut {
+            entry_id: g.repr_id,
+            name: base,
+            host: g.host,
+            url: g.url,
+            size,
+            size_exact: exact,
+            resolution,
+            segments: g.segments,
+            range_group,
+            is_video: false,
+            audio_entry_id: None,
+        });
+    }
+    for v in dash_items.iter_mut() {
+        v.is_video = v.resolution.is_some();
+    }
+    // 音视频轨配对：同 host、基名前缀（去掉最后一段码率/轨道号）相同，一视频一音频。
+    // 仅在 ffmpeg 可用时启用（否则合并下载不可用，两条分开列）。
+    let track_prefix = |n: &str| {
+        n.rsplit_once('-')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| n.to_string())
+    };
+    if mux_available {
+        for i in 0..dash_items.len() {
+            if !dash_items[i].is_video || dash_items[i].audio_entry_id.is_some() {
+                continue;
+            }
+            let vp = track_prefix(&dash_items[i].name);
+            let host = dash_items[i].host.clone();
+            if let Some(j) = (0..dash_items.len()).find(|&j| {
+                j != i
+                    && !dash_items[j].is_video
+                    && dash_items[j].audio_entry_id.is_none()
+                    && dash_items[j].host == host
+                    && track_prefix(&dash_items[j].name) == vp
+            }) {
+                dash_items[i].size += dash_items[j].size;
+                dash_items[i].size_exact &= dash_items[j].size_exact;
+                dash_items[i].audio_entry_id = Some(dash_items[j].entry_id);
+                dash_items[j].audio_entry_id = Some(0); // 标记已被配走
+            }
+        }
+    }
+    for v in dash_items {
+        if v.audio_entry_id == Some(0) {
+            continue; // 已被配进对应视频轨
+        }
         items.push(serde_json::json!({
-            "entryId": g.repr_id, "kind": "dash", "name": base, "host": g.host,
-            "url": g.url, "size": size, "sizeExact": exact, "resolution": resolution,
-            "durationSec": serde_json::Value::Null, "segments": g.segments,
-            "rangeGroup": range_group,
+            "entryId": v.entry_id, "kind": "dash", "name": v.name, "host": v.host,
+            "url": v.url, "size": v.size, "sizeExact": v.size_exact,
+            "resolution": v.resolution, "durationSec": serde_json::Value::Null,
+            "segments": v.segments, "rangeGroup": v.range_group,
+            "audioEntryId": v.audio_entry_id,
         }));
     }
 
     // 大的排前面，同尺寸按新记录优先
-    items.sort_by(|a, b| {
-        let sa = a["size"].as_u64().unwrap_or(0);
+    items.sort_by(|a, b| {        let sa = a["size"].as_u64().unwrap_or(0);
         let sb = b["size"].as_u64().unwrap_or(0);
         sb.cmp(&sa).then(b["entryId"].as_u64().cmp(&a["entryId"].as_u64()))
     });
-    json_response(serde_json::json!({ "items": items }))
+    json_response(serde_json::json!({
+        "items": items,
+        "muxAvailable": mux_available,
+    }))
 }
 
 

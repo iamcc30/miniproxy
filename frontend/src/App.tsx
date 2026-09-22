@@ -1096,9 +1096,11 @@ export default function App() {
                         href={videoDownloadUrl(v)}
                         download
                         title={
-                          v.kind === 'dash' && !v.rangeGroup
-                            ? '拼接已捕获的分段并下载'
-                            : '从源站重新拉取完整视频'
+                          v.audioEntryId
+                            ? '分别拉取音视频轨并用 ffmpeg 合并为一个 mp4'
+                            : v.kind === 'dash' && !v.rangeGroup
+                              ? '拼接已捕获的分段并下载'
+                              : '从源站重新拉取完整视频'
                         }
                       >
                         ⬇ 下载

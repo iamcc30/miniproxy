@@ -705,6 +705,8 @@ export interface VideoItem {
   ext?: string;
   /** dash 专属：组内所有分段是否同一 URL（Range 分块型） */
   rangeGroup?: boolean;
+  /** 配对成功的音频轨条目：存在时下载走 /fullmux（音视频合并成一个 mp4） */
+  audioEntryId?: number | null;
 }
 
 export async function fetchVideos(): Promise<VideoItem[]> {
@@ -716,11 +718,15 @@ export async function fetchVideos(): Promise<VideoItem[]> {
 
 /**
  * 下载入口：
+ * - 配对了音频轨 → /fullmux（音视频各自整文件拉取后 ffmpeg 合并成一个 mp4）；
  * - Range 分块型 dash（B 站等）：/fullvideo 整文件重拉，保证完整；
  * - 分段文件型 dash（推特 .m4s 等）：/stitch 拼接已捕获分段（无 manifest 无法枚举全部分段）；
  * - 其余走 /fullvideo（源站重拉）。
  */
 export function videoDownloadUrl(v: VideoItem): string {
+  if (v.audioEntryId) {
+    return '/api/entries/' + v.entryId + '/fullmux?a=' + v.audioEntryId;
+  }
   const useStitch = v.kind === 'dash' && !v.rangeGroup;
   return '/api/entries/' + v.entryId + '/' + (useStitch ? 'stitch' : 'fullvideo');
 }
