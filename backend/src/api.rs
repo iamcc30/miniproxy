@@ -90,10 +90,15 @@ fn safe_download_name(e: &crate::capture::Entry) -> String {
         && last
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-~".contains(c));
-    if ok {
+    let name = if ok {
         last.to_string()
     } else {
         format!("entry-{}", e.id)
+    };
+    // .m4s 与 .mp4 是同一种 fMP4 容器，改后缀浏览器/播放器才能直接识别
+    match name.rsplit_once('.') {
+        Some((stem, "m4s")) => format!("{}.mp4", stem),
+        _ => name,
     }
 }
 
