@@ -687,7 +687,11 @@ export function suggestFilename(url: string, fallback = 'body.bin'): string {
 
 export interface VideoItem {
   entryId: number;
-  /** file=独立文件(整文件重拉) / hls=m3u8 点播(实时拼段) / dash=fMP4 分段组(拼接已捕获分段) */
+  /**
+   * file=独立文件(整文件重拉) / hls=m3u8 点播(实时拼段) /
+   * dash=fMP4 分段组（rangeGroup=true 时是同一 URL 的 Range 分块，可整文件重拉；
+   * false 时是 init+分段文件组，只能拼接已捕获分段）
+   */
   kind: 'file' | 'hls' | 'dash';
   name: string;
   host: string;
@@ -699,6 +703,8 @@ export interface VideoItem {
   durationSec: number | null;
   segments: number | null;
   ext?: string;
+  /** dash 专属：组内所有分段是否同一 URL（Range 分块型） */
+  rangeGroup?: boolean;
 }
 
 export async function fetchVideos(): Promise<VideoItem[]> {
@@ -708,9 +714,15 @@ export async function fetchVideos(): Promise<VideoItem[]> {
   return j.items ?? [];
 }
 
-/** 下载入口：DASH 分段组走 stitch（拼接已捕获分段），其余走 fullvideo（源站重拉） */
+/**
+ * 下载入口：
+ * - Range 分块型 dash（B 站等）：/fullvideo 整文件重拉，保证完整；
+ * - 分段文件型 dash（推特 .m4s 等）：/stitch 拼接已捕获分段（无 manifest 无法枚举全部分段）；
+ * - 其余走 /fullvideo（源站重拉）。
+ */
 export function videoDownloadUrl(v: VideoItem): string {
-  return '/api/entries/' + v.entryId + '/' + (v.kind === 'dash' ? 'stitch' : 'fullvideo');
+  const useStitch = v.kind === 'dash' && !v.rangeGroup;
+  return '/api/entries/' + v.entryId + '/' + (useStitch ? 'stitch' : 'fullvideo');
 }
 
 /** 秒数 → mm:ss / h:mm:ss */

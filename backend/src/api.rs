@@ -199,9 +199,43 @@ fn is_mp4_init(b: &[u8]) -> bool {
             t == b"ftyp"
                 && b.windows(4).any(|w| w == b"moov")
                 && !b.windows(4).take(4096).any(|w| w == b"moof")
+                // 不含 mdat：init 只有编码头；完整 MP4 文件（ftyp+moov+mdat）不算 init
+                && !has_mdat_box(b)
         }
         None => false,
     }
+}
+
+/// 沿顶层 box 链找 mdat（完整 MP4 的标志）
+fn has_mdat_box(b: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off + 8 <= b.len() {
+        let size = u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as u64;
+        let typ = &b[off + 4..off + 8];
+        if typ == b"mdat" {
+            return true;
+        }
+        if size == 0 {
+            return false; // mdat 到文件尾，后面没有别的 box
+        }
+        if size == 1 {
+            // 64 位 largesize
+            if off + 16 > b.len() {
+                return false;
+            }
+            let large = u64::from_be_bytes([
+                b[off + 8], b[off + 9], b[off + 10], b[off + 11],
+                b[off + 12], b[off + 13], b[off + 14], b[off + 15],
+            ]);
+            if large < 16 {
+                return false;
+            }
+            off += large as usize;
+        } else {
+            off += size as usize;
+        }
+    }
+    false
 }
 
 /// 从请求头里取 Range 起始字节（bytes=START-END）。
@@ -567,11 +601,13 @@ async fn entry_fullvideo(req: Request<Body>, app: Arc<App>, path: &str) -> Respo
             .unwrap_or(false);
 
     if !is_hls {
-        // 普通媒体：必须是音视频类型才允许
+        // 普通媒体：必须是音视频类型才允许（Content-Type 不可靠，B 站等会回 octet-stream，
+        // 此时用 URL 扩展名兜底）
         let media_ok = content_type
             .as_deref()
             .map(|ct| ct.starts_with("video/") || ct.starts_with("audio/"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || VIDEO_EXTS.contains(&path_ext(&url).as_str());
         if !media_ok {
             return json_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -953,7 +989,7 @@ fn path_ext(url: &str) -> String {
     }
 }
 
-const VIDEO_EXTS: &[&str] = &["mp4", "webm", "flv", "mkv", "mov", "m4v", "avi", "ts", "mp3", "m4a", "aac", "wav", "ogg", "opus"];
+const VIDEO_EXTS: &[&str] = &["mp4", "m4s", "webm", "flv", "mkv", "mov", "m4v", "avi", "ts", "mp3", "m4a", "aac", "wav", "ogg", "opus"];
 
 /// m3u8 文本里 SUM(EXTINF) 秒数
 fn hls_duration(text: &str) -> f64 {
@@ -1037,6 +1073,12 @@ fn list_videos(app: &App) -> Response<Body> {
                     v.rsplit('/').next()?.trim().parse::<u64>().ok()
                 })
             });
+            // Range 头只有在响应确实是 206 分段时才算数（有些服务器忽略 Range 返回 200 全量）
+            let range = if inner.resp_status == Some(206) {
+                range_start(&e.req_headers)
+            } else {
+                None
+            };
             // 注意：body_of 会再次锁 e.inner，std Mutex 不可重入，
             // 必须先在本块里取完所有字段并释放 inner 锁，再拷正文
             let (body, body_full, size) = {
@@ -1058,7 +1100,7 @@ fn list_videos(app: &App) -> Response<Body> {
                 body,
                 body_full,
                 size,
-                range: range_start(&e.req_headers),
+                range,
                 total_len,
             });
         }
@@ -1183,6 +1225,12 @@ fn list_videos(app: &App) -> Response<Body> {
         size: u64,
         segments: usize,
         init_body: Option<Vec<u8>>,
+        /// 组内去重后的 URL（去 query）；全部相同 = Range 分块组（可整文件重拉）
+        urls: Vec<String>,
+        /// 组内见过的 Content-Range 总长（精确文件大小）
+        total_len: Option<u64>,
+        /// 组内成员自身是完整 MP4（ftyp+moov+mdat）时，从它解析的分辨率（优先于 init）
+        self_res: Option<(u32, u32)>,
     }
     let mut dash: BTreeMap<(String, String, String), DashGroup> = BTreeMap::new();
     let mut inits: Vec<(String, String, String, Vec<u8>)> = Vec::new(); // (host, dir, base, body)
@@ -1203,6 +1251,7 @@ fn list_videos(app: &App) -> Response<Body> {
             inits.push((s.host.clone(), dir, base, body.clone()));
         } else if is_seg {
             let key = (s.host.clone(), dir, base.clone());
+            let url_no_q = s.url.split('?').next().unwrap_or(&s.url).to_string();
             let g = dash.entry(key).or_insert_with(|| DashGroup {
                 repr_id: s.id,
                 name: base.clone(),
@@ -1211,16 +1260,37 @@ fn list_videos(app: &App) -> Response<Body> {
                 size: 0,
                 segments: 0,
                 init_body: None,
+                urls: Vec::new(),
+                total_len: None,
+                self_res: None,
             });
             g.size += s.size;
             g.segments += 1;
+            if !g.urls.iter().any(|u| *u == url_no_q) {
+                g.urls.push(url_no_q);
+            }
+            if let Some(t) = s.total_len {
+                let cur = g.total_len.get_or_insert(t);
+                if t > *cur {
+                    *cur = t;
+                }
+            }
+            // 成员自身是完整 MP4（ftyp+moov+mdat）→ 用它自己的 moov 解析分辨率
+            if g.self_res.is_none() {
+                if let Some(body) = &s.body {
+                    if first_box_type(body) == Some(b"ftyp") && has_mdat_box(body) {
+                        g.self_res = mp4_resolution(body);
+                    }
+                }
+            }
         }
     }
     for (key, g) in dash.iter_mut() {
-        // init 匹配：同目录，或基名相同（stitch_dash 的宽松规则近似）
+        // init 匹配：优先基名相同（最可靠），其次同目录
         g.init_body = inits
             .iter()
-            .find(|(h, d, b, _)| *h == key.0 && (*d == key.1 || *b == key.2))
+            .find(|(h, d, b, _)| *h == key.0 && *b == key.2)
+            .or_else(|| inits.iter().find(|(h, d, _, _)| *h == key.0 && *d == key.1))
             .map(|(_, _, _, body)| body.clone());
     }
 
@@ -1294,14 +1364,28 @@ fn list_videos(app: &App) -> Response<Body> {
         }));
     }
 
-    // DASH 组收进结果（须 init 齐全；大小是已捕获分段的合计，标注为估算）
+    // DASH 组收进结果（须 init 齐全；Range 分块组用 Content-Range 总长做精确大小）
     for ((_, _, base), g) in dash {
         let Some(_) = g.init_body else { continue };
-        let resolution = g.init_body.as_deref().and_then(mp4_resolution).map(|(w, h)| format!("{}x{}", w, h));
+        let range_group = g.urls.len() <= 1; // 所有分段同一 URL = Range 分块组
+        let init_res = g.init_body.as_deref().and_then(mp4_resolution);
+        let resolution = g
+            .self_res
+            .or(init_res)
+            .map(|(w, h)| format!("{}x{}", w, h));
+        let (size, exact) = if range_group {
+            match g.total_len {
+                Some(t) => (Some(t), true),
+                None => (Some(g.size), false),
+            }
+        } else {
+            (Some(g.size), false) // 分段文件组只能按已捕获合计估算
+        };
         items.push(serde_json::json!({
             "entryId": g.repr_id, "kind": "dash", "name": base, "host": g.host,
-            "url": g.url, "size": g.size, "sizeExact": false, "resolution": resolution,
+            "url": g.url, "size": size, "sizeExact": exact, "resolution": resolution,
             "durationSec": serde_json::Value::Null, "segments": g.segments,
+            "rangeGroup": range_group,
         }));
     }
 

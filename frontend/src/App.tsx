@@ -1075,7 +1075,7 @@ export default function App() {
                   {videos.map((v) => (
                     <div key={`${v.kind}-${v.entryId}`} className="video-row">
                       <span className={`video-kind kind-${v.kind}`}>
-                        {v.kind === 'hls' ? 'HLS' : v.kind === 'dash' ? '分段' : '直链'}
+                        {v.kind === 'hls' ? 'HLS' : v.kind === 'dash' ? (v.rangeGroup ? '分块' : '分段') : '直链'}
                       </span>
                       <div className="video-main">
                         <div className="video-name" title={v.url}>{v.name}</div>
@@ -1095,7 +1095,11 @@ export default function App() {
                         className="btn primary video-dl"
                         href={videoDownloadUrl(v)}
                         download
-                        title={v.kind === 'dash' ? '拼接已捕获的分段并下载' : '从源站重新拉取完整视频'}
+                        title={
+                          v.kind === 'dash' && !v.rangeGroup
+                            ? '拼接已捕获的分段并下载'
+                            : '从源站重新拉取完整视频'
+                        }
                       >
                         ⬇ 下载
                       </a>
