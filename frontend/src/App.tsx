@@ -29,6 +29,10 @@ import {
   fetchInfo,
   fetchSysProxy,
   fetchUpstream,
+  fetchVideos,
+  formatDuration,
+  VideoItem,
+  videoDownloadUrl,
   filtersToQuery,
   formatBytes,
   formatTime,
@@ -401,6 +405,10 @@ export default function App() {
   const [sysBusy, setSysBusy] = useState(false);
   const [info, setInfo] = useState<Awaited<ReturnType<typeof fetchInfo>> | null>(null);
   const [lanDismissed, setLanDismissed] = useState(false);
+  // 视频下载器面板
+  const [videoOpen, setVideoOpen] = useState(false);
+  const [videos, setVideos] = useState<VideoItem[] | null>(null);
+  const [videoErr, setVideoErr] = useState<string | null>(null);
   // 局域网帮助默认收起：点提示条才展开说明与二维码
   const [lanHelpOpen, setLanHelpOpen] = useState(false);
   const esRef = useRef<EventSource | null>(null);
@@ -597,6 +605,21 @@ export default function App() {
     }
   }, [sysProxy, sysBusy]);
 
+  // 视频下载器：打开/刷新时拉取聚合列表
+  const loadVideos = useCallback(async () => {
+    setVideoErr(null);
+    setVideos(null);
+    try {
+      setVideos(await fetchVideos());
+    } catch (e) {
+      setVideoErr(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+  const openVideos = useCallback(() => {
+    setVideoOpen(true);
+    loadVideos();
+  }, [loadVideos]);
+
   // 详情：选中即拉取；ws 进行中每 1.5s 刷新
   useEffect(() => {
     if (selectedId == null) return;
@@ -703,6 +726,9 @@ export default function App() {
           {paused ? '▶ 恢复' : '⏸ 暂停'}
         </button>
         <button className="btn danger" onClick={onClear}>🗑 清空</button>
+        <button className="btn" onClick={openVideos} title="列出抓到的完整视频，点击即可下载">
+          🎬 视频
+        </button>
         {sysProxy?.supported && (
           <button
             className={`btn ${sysProxy.active ? 'primary' : ''}`}
@@ -1021,6 +1047,66 @@ export default function App() {
           </section>
         )}
       </div>
+
+      {videoOpen && (
+        <div className="modal-mask" onClick={() => setVideoOpen(false)}>
+          <div className="video-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="视频下载器">
+            <div className="video-modal-head">
+              <span className="sub-title" style={{ margin: 0 }}>🎬 视频下载</span>
+              <span className="video-hint">来自本次抓包 · 只列出可完整获取的视频</span>
+              <div className="spacer" />
+              <button type="button" className="btn" onClick={loadVideos}>↻ 刷新</button>
+              <button type="button" className="btn" onClick={() => setVideoOpen(false)}>×</button>
+            </div>
+            <div className="video-modal-body">
+              {videoErr && <div className="empty-state"><div style={{ fontSize: 28 }}>⚠️</div><div>{videoErr}</div></div>}
+              {!videoErr && videos === null && (
+                <div className="empty-state"><div style={{ fontSize: 28 }}>⏳</div><div>正在扫描抓包记录…</div></div>
+              )}
+              {!videoErr && videos !== null && videos.length === 0 && (
+                <div className="empty-state">
+                  <div style={{ fontSize: 32 }}>🎬</div>
+                  <div>还没抓到可下载的完整视频</div>
+                  <div>播放一次视频（直播除外）让分段被抓全，再点「刷新」</div>
+                </div>
+              )}
+              {videos !== null && videos.length > 0 && (
+                <div className="video-list">
+                  {videos.map((v) => (
+                    <div key={`${v.kind}-${v.entryId}`} className="video-row">
+                      <span className={`video-kind kind-${v.kind}`}>
+                        {v.kind === 'hls' ? 'HLS' : v.kind === 'dash' ? '分段' : '直链'}
+                      </span>
+                      <div className="video-main">
+                        <div className="video-name" title={v.url}>{v.name}</div>
+                        <div className="video-meta">
+                          <span title="来源域名">{v.host}</span>
+                          {v.resolution && <span title="分辨率">{v.resolution}</span>}
+                          {v.durationSec != null && <span title="时长">{formatDuration(v.durationSec)}</span>}
+                          {v.size != null && (
+                            <span title={v.sizeExact ? '精确大小' : '按已捕获分段估算'}>
+                              {v.sizeExact ? '' : '≈'}{formatBytes(v.size)}
+                            </span>
+                          )}
+                          {v.segments != null && <span title="已捕获分段数">{v.segments} 段</span>}
+                        </div>
+                      </div>
+                      <a
+                        className="btn primary video-dl"
+                        href={videoDownloadUrl(v)}
+                        download
+                        title={v.kind === 'dash' ? '拼接已捕获的分段并下载' : '从源站重新拉取完整视频'}
+                      >
+                        ⬇ 下载
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

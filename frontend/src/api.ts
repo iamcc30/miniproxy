@@ -682,3 +682,43 @@ export function suggestFilename(url: string, fallback = 'body.bin'): string {
     return fallback;
   }
 }
+
+/* ---------------- 视频下载器 ---------------- */
+
+export interface VideoItem {
+  entryId: number;
+  /** file=独立文件(整文件重拉) / hls=m3u8 点播(实时拼段) / dash=fMP4 分段组(拼接已捕获分段) */
+  kind: 'file' | 'hls' | 'dash';
+  name: string;
+  host: string;
+  url: string;
+  size: number | null;
+  /** size 是否为精确值（false = 按已捕获分段估算） */
+  sizeExact: boolean;
+  resolution: string | null;
+  durationSec: number | null;
+  segments: number | null;
+  ext?: string;
+}
+
+export async function fetchVideos(): Promise<VideoItem[]> {
+  const r = await fetch('/api/videos');
+  if (!r.ok) throw new Error('加载视频列表失败');
+  const j = await r.json();
+  return j.items ?? [];
+}
+
+/** 下载入口：DASH 分段组走 stitch（拼接已捕获分段），其余走 fullvideo（源站重拉） */
+export function videoDownloadUrl(v: VideoItem): string {
+  return '/api/entries/' + v.entryId + '/' + (v.kind === 'dash' ? 'stitch' : 'fullvideo');
+}
+
+/** 秒数 → mm:ss / h:mm:ss */
+export function formatDuration(sec: number): string {
+  const s = Math.round(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? h + ':' + pad(m) + ':' + pad(r) : m + ':' + pad(r);
+}

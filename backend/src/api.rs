@@ -22,6 +22,7 @@ pub async fn handle_api(
 
     let resp = match (&method, path.as_str()) {
         (&Method::GET, "/api/entries") => list_entries(req, &app),
+        (&Method::GET, "/api/videos") => list_videos(&app),
         (&Method::GET, "/api/facets") => list_facets(&app),
         (&Method::GET, "/api/hosts") => list_hosts(&app),
         (&Method::GET, "/api/types") => list_types(&app),
@@ -883,6 +884,436 @@ fn list_types(app: &App) -> Response<Body> {
     types.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
     json_response(serde_json::json!({ "types": types }))
 }
+
+/* ---------------- 视频下载器聚合列表 ---------------- */
+
+/// MP4 解析：在字节里找 moov/tkhd，取面积最大的视频轨宽高（16.16 定点存储）。
+/// 只读不猜：找不到 moov（如存储被截断）就返回 None。
+fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
+    /// 遍历一层 box：返回 (类型, payload)。兼容 64 位 largesize 与 size==0（到文件尾）。
+    fn boxes(b: &[u8]) -> Vec<(&[u8], &[u8])> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 8 <= b.len() {
+            let size = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+            let typ = &b[i + 4..i + 8];
+            let (payload_start, payload_len) = if size == 1 {
+                if i + 16 > b.len() {
+                    break;
+                }
+                let l = u64::from_be_bytes(b[i + 8..i + 16].try_into().unwrap()) as usize;
+                if l < 16 {
+                    break;
+                }
+                (i + 16, l - 16)
+            } else if size == 0 {
+                (i + 8, b.len() - i - 8)
+            } else if size >= 8 {
+                (i + 8, size - 8)
+            } else {
+                break;
+            };
+            let end = (payload_start + payload_len).min(b.len());
+            if payload_start > end {
+                break;
+            }
+            out.push((typ, &b[payload_start..end]));
+            i = end;
+        }
+        out
+    }
+    for (t, payload) in boxes(b) {
+        if t != b"moov" {
+            continue;
+        }
+        let mut best: Option<(u64, u32, u32)> = None;
+        for (ct, p) in boxes(payload) {
+            if ct == b"tkhd" && p.len() >= 8 {
+                // width/height 固定在 tkhd 末尾 8 字节
+                let w = u32::from_be_bytes(p[p.len() - 8..p.len() - 4].try_into().unwrap()) >> 16;
+                let h = u32::from_be_bytes(p[p.len() - 4..].try_into().unwrap()) >> 16;
+                if w > 0 && h > 0 && best.as_ref().map(|(a, _, _)| w as u64 * h as u64 > *a).unwrap_or(true) {
+                    best = Some((w as u64 * h as u64, w, h));
+                }
+            }
+        }
+        if let Some((_, w, h)) = best {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+/// URL 路径（去 query）的小写扩展名
+fn path_ext(url: &str) -> String {
+    let p = url_path(url).to_lowercase();
+    match p.rsplit_once('.') {
+        Some((_, ext)) if !ext.contains('/') && ext.len() <= 8 => ext.to_string(),
+        _ => String::new(),
+    }
+}
+
+const VIDEO_EXTS: &[&str] = &["mp4", "webm", "flv", "mkv", "mov", "m4v", "avi", "ts", "mp3", "m4a", "aac", "wav", "ogg", "opus"];
+
+/// m3u8 文本里 SUM(EXTINF) 秒数
+fn hls_duration(text: &str) -> f64 {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("#EXTINF:"))
+        .filter_map(|v| v.split(',').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .sum()
+}
+
+/// master playlist 里的最大 RESOLUTION（"1280x720"）
+fn hls_resolution(text: &str) -> Option<String> {
+    let mut best: Option<(u64, String)> = None;
+    for line in text.lines() {
+        let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF") else { continue };
+        for kv in attrs.split(',') {
+            let kv = kv.trim().trim_start_matches(':');
+            let mut it = kv.split('=');
+            let k = it.next().unwrap_or("").trim().to_ascii_uppercase();
+            if k != "RESOLUTION" {
+                continue;
+            }
+            let v = it.next().unwrap_or("").trim();
+            let (w, h) = match v.split_once('x') {
+                Some((w, h)) => (w.trim().parse::<u64>().unwrap_or(0), h.trim().parse::<u64>().unwrap_or(0)),
+                None => continue,
+            };
+            if w > 0 && h > 0 && best.as_ref().map(|(a, _)| w * h > *a).unwrap_or(true) {
+                best = Some((w * h, format!("{}x{}", w, h)));
+            }
+        }
+    }
+    best.map(|(_, r)| r)
+}
+
+/// 单条抓包条目的轻量快照（只对「可能是媒体」的条目拷贝正文，控制内存）
+struct VidSnap {
+    id: u64,
+    url: String,
+    host: String,
+    ct: Option<String>,
+    body: Option<Vec<u8>>,
+    body_full: bool,
+    size: u64,
+    range: Option<u64>,
+    total_len: Option<u64>, // Content-Range 里的总大小
+}
+
+/// 视频下载器：把抓包条目聚合为「可完整获取」的视频列表。
+/// 三类来源（下载入口各不相同）：
+/// - file：独立音视频文件 → /fullvideo 整文件重拉，不受存储截断影响
+/// - hls：VOD m3u8（须见过 #EXT-X-ENDLIST，直播流排除）→ /fullvideo 实时拼段
+/// - dash：init 齐全的 fMP4 分段组（推特 .m4s / Range 分块）→ /stitch 拼接已捕获分段
+fn list_videos(app: &App) -> Response<Body> {
+    use std::collections::BTreeMap;
+
+    // ---- 快照：只拷贝可能是媒体的条目 ----
+    let mut snaps: Vec<VidSnap> = Vec::new();
+    {
+        let list = app.store.entries.lock().unwrap();
+        for e in list.iter() {
+            if e.kind != "http" {
+                continue;
+            }
+            let inner = e.inner.lock().unwrap();
+            let ok = matches!(inner.resp_status, Some(s) if (200..300).contains(&s));
+            if !ok {
+                continue;
+            }
+            let ct = inner.content_type.clone();
+            let ext = path_ext(&e.url);
+            let ct_media = ct
+                .as_deref()
+                .map(|c| c.starts_with("video/") || c.starts_with("audio/") || c.to_lowercase().contains("mpegurl"))
+                .unwrap_or(false);
+            if !ct_media && !VIDEO_EXTS.contains(&ext.as_str()) && ext != "m4s" {
+                continue;
+            }
+            let total_len = inner.resp_headers.as_ref().and_then(|hs| {
+                hs.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-range")).and_then(|(_, v)| {
+                    v.rsplit('/').next()?.trim().parse::<u64>().ok()
+                })
+            });
+            // 注意：body_of 会再次锁 e.inner，std Mutex 不可重入，
+            // 必须先在本块里取完所有字段并释放 inner 锁，再拷正文
+            let (body, body_full, size) = {
+                let need_body = ct_media || ext == "m4s" || ext == "ts" || ext == "mp4";
+                let full = !inner.resp_truncated;
+                let sz = inner.resp_body.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
+                if need_body {
+                    drop(inner);
+                    (body_of(e, "resp"), full, sz)
+                } else {
+                    (None, full, sz)
+                }
+            };
+            snaps.push(VidSnap {
+                id: e.id,
+                url: e.url.clone(),
+                host: e.host.clone(),
+                ct,
+                body,
+                body_full,
+                size,
+                range: range_start(&e.req_headers),
+                total_len,
+            });
+        }
+    }
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+
+    // ---- 1. HLS：m3u8 条目聚合 ----
+    // master 优先作为代表（fullvideo 会自动选最高码率）；它引用的变体 playlist 不再单独出条目。
+    struct HlsItem {
+        id: u64,
+        name: String,
+        host: String,
+        url: String,
+        resolution: Option<String>,
+        duration: f64,
+        variants: Vec<String>, // master 引用的变体 URL（media playlist 为空）
+    }
+    let mut masters: Vec<HlsItem> = Vec::new();
+    let mut medias: Vec<HlsItem> = Vec::new();
+    // 只有「含 ENDLIST 的 media playlist 所在目录」才算 HLS 分段目录；
+    // master 常与无关文件同目录，不能拿来排除
+    let mut hls_seg_dirs: Vec<String> = Vec::new();
+
+    for s in &snaps {
+        let ext = path_ext(&s.url);
+        let is_pl = ext == "m3u8"
+            || s.ct.as_deref().map(|c| c.to_lowercase().contains("mpegurl")).unwrap_or(false);
+        if !is_pl {
+            continue;
+        }
+        let Some(body) = &s.body else { continue };
+        let text = String::from_utf8_lossy(body);
+        let name = {
+            let n = strip_ext(url_name(&s.url)).to_string();
+            if n.is_empty() || n == "index" || n == "playlist" || n == "master" {
+                format!("video-{}", s.id)
+            } else {
+                n
+            }
+        };
+        if text.contains("#EXT-X-STREAM-INF") {
+            let mut variants: Vec<String> = Vec::new();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                if lines[i].starts_with("#EXT-X-STREAM-INF") {
+                    if let Some(uri) = lines[i + 1..].iter().find(|l| !l.trim().starts_with('#')) {
+                        variants.push(resolve_url(&s.url, uri.trim()));
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            masters.push(HlsItem {
+                id: s.id,
+                name,
+                host: s.host.clone(),
+                url: s.url.clone(),
+                resolution: hls_resolution(&text),
+                duration: 0.0,
+                variants,
+            });
+        } else if text.contains("#EXT-X-ENDLIST") {
+            // 点播 media playlist：只有见过 ENDLIST 才认定「完整视频存在」，直播流排除
+            hls_seg_dirs.push(url_dir(&s.url).to_string());
+            medias.push(HlsItem {
+                id: s.id,
+                name,
+                host: s.host.clone(),
+                url: s.url.clone(),
+                resolution: None,
+                duration: hls_duration(&text),
+                variants: Vec::new(),
+            });
+        }
+    }
+
+    // 变体被 master 引用 → 时长并入 master、不单独出条目；其余 media playlist 独立成条目
+    let mut consumed: Vec<String> = Vec::new();
+    for m in &mut masters {
+        for md in &medias {
+            if m.variants.iter().any(|v| *v == md.url) {
+                m.duration = m.duration.max(md.duration);
+                consumed.push(md.url.clone());
+            }
+        }
+        let covered = m.variants.iter().any(|v| {
+            medias.iter().any(|md| md.url == *v)
+        });
+        if !covered {
+            continue; // 引用的变体没抓到或没见过 ENDLIST，无法确认是完整点播
+        }
+        items.push(serde_json::json!({
+            "entryId": m.id, "kind": "hls", "name": m.name, "host": m.host,
+            "url": m.url, "size": serde_json::Value::Null,
+            "sizeExact": false, "resolution": m.resolution,
+            "durationSec": if m.duration > 0.0 { serde_json::json!(m.duration) } else { serde_json::Value::Null },
+            "segments": serde_json::Value::Null,
+        }));
+    }
+    for md in &medias {
+        if consumed.contains(&md.url) {
+            continue;
+        }
+        items.push(serde_json::json!({
+            "entryId": md.id, "kind": "hls", "name": md.name, "host": md.host,
+            "url": md.url, "size": serde_json::Value::Null,
+            "sizeExact": false, "resolution": md.resolution,
+            "durationSec": if md.duration > 0.0 { serde_json::json!(md.duration) } else { serde_json::Value::Null },
+            "segments": serde_json::Value::Null,
+        }));
+    }
+
+    // ---- 2. DASH 分段组：is_mp4_segment 的 m4s 按 (host, dir, base) 归组，须有 init ----
+    struct DashGroup {
+        repr_id: u64,
+        name: String,
+        host: String,
+        url: String,
+        size: u64,
+        segments: usize,
+        init_body: Option<Vec<u8>>,
+    }
+    let mut dash: BTreeMap<(String, String, String), DashGroup> = BTreeMap::new();
+    let mut inits: Vec<(String, String, String, Vec<u8>)> = Vec::new(); // (host, dir, base, body)
+    for s in &snaps {
+        let ext = path_ext(&s.url);
+        let is_seg = ext == "m4s" || s.body.as_deref().map(is_mp4_segment).unwrap_or(false);
+        let Some(body) = &s.body else { continue };
+        let dir = url_dir(&s.url).to_string();
+        let base = {
+            let n = strip_ext(url_name(&s.url)).to_string();
+            if is_seg {
+                seg_base(&n).to_string()
+            } else {
+                n
+            }
+        };
+        if is_mp4_init(body) {
+            inits.push((s.host.clone(), dir, base, body.clone()));
+        } else if is_seg {
+            let key = (s.host.clone(), dir, base.clone());
+            let g = dash.entry(key).or_insert_with(|| DashGroup {
+                repr_id: s.id,
+                name: base.clone(),
+                host: s.host.clone(),
+                url: s.url.clone(),
+                size: 0,
+                segments: 0,
+                init_body: None,
+            });
+            g.size += s.size;
+            g.segments += 1;
+        }
+    }
+    for (key, g) in dash.iter_mut() {
+        // init 匹配：同目录，或基名相同（stitch_dash 的宽松规则近似）
+        g.init_body = inits
+            .iter()
+            .find(|(h, d, b, _)| *h == key.0 && (*d == key.1 || *b == key.2))
+            .map(|(_, _, _, body)| body.clone());
+    }
+
+    // ---- 3. 独立媒体文件：排除 m4s 分段 / m3u8 / 已被 HLS 收编的同目录 ts、mp4 ----
+    for s in &snaps {
+        let ext = path_ext(&s.url);
+        if ext == "m3u8" || s.ct.as_deref().map(|c| c.to_lowercase().contains("mpegurl")).unwrap_or(false) {
+            continue;
+        }
+        let is_seg = ext == "m4s" || s.body.as_deref().map(is_mp4_segment).unwrap_or(false);
+        if is_seg {
+            continue;
+        }
+        // Range 分块的同 URL 重复条目：只收起点最小（最好是 0）的那条
+        let url_key = s.url.split('?').next().unwrap_or(&s.url).to_string();
+        let is_ranged = s.range.map(|r| r > 0).unwrap_or(false);
+        if is_ranged {
+            let better = snaps.iter().any(|o| {
+                o.url.split('?').next().map(|p| p.to_string()) == Some(url_key.clone())
+                    && o.range.unwrap_or(0) < s.range.unwrap_or(0)
+            });
+            if better {
+                continue;
+            }
+        }
+        // 该目录存在点播 media playlist 时，ts 通常是 HLS 分段，不单列
+        if ext == "ts" && hls_seg_dirs.iter().any(|d| *d == url_dir(&s.url)) {
+            continue;
+        }
+        let ct_media = s
+            .ct
+            .as_deref()
+            .map(|c| c.starts_with("video/") || c.starts_with("audio/"))
+            .unwrap_or(false);
+        if !ct_media && !VIDEO_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        // 过滤噪音：太小的“媒体”多半是图标/试听片段
+        if s.size < 16 * 1024 {
+            continue;
+        }
+        let name = {
+            let raw = url_name(&s.url);
+            let n = strip_ext(raw.split('?').next().unwrap_or(raw)).to_string();
+            if n.is_empty() {
+                format!("media-{}", s.id)
+            } else {
+                n
+            }
+        };
+        let out_ext = if VIDEO_EXTS.contains(&ext.as_str()) { ext.as_str() } else { "mp4" };
+        // 大小：完整存储用实际字节数；截断时用 Content-Range 总长；再不行不给
+        let (size, exact) = if s.body_full && s.range.unwrap_or(0) == 0 {
+            (Some(s.size), true)
+        } else if let Some(t) = s.total_len {
+            (Some(t), true)
+        } else {
+            (None, false)
+        };
+        let resolution = s
+            .body
+            .as_deref()
+            .filter(|_| s.body_full)
+            .and_then(mp4_resolution)
+            .map(|(w, h)| format!("{}x{}", w, h));
+        items.push(serde_json::json!({
+            "entryId": s.id, "kind": "file", "name": name, "host": s.host,
+            "url": s.url, "size": size, "sizeExact": exact, "resolution": resolution,
+            "durationSec": serde_json::Value::Null, "segments": serde_json::Value::Null,
+            "ext": out_ext,
+        }));
+    }
+
+    // DASH 组收进结果（须 init 齐全；大小是已捕获分段的合计，标注为估算）
+    for ((_, _, base), g) in dash {
+        let Some(_) = g.init_body else { continue };
+        let resolution = g.init_body.as_deref().and_then(mp4_resolution).map(|(w, h)| format!("{}x{}", w, h));
+        items.push(serde_json::json!({
+            "entryId": g.repr_id, "kind": "dash", "name": base, "host": g.host,
+            "url": g.url, "size": g.size, "sizeExact": false, "resolution": resolution,
+            "durationSec": serde_json::Value::Null, "segments": g.segments,
+        }));
+    }
+
+    // 大的排前面，同尺寸按新记录优先
+    items.sort_by(|a, b| {
+        let sa = a["size"].as_u64().unwrap_or(0);
+        let sb = b["size"].as_u64().unwrap_or(0);
+        sb.cmp(&sa).then(b["entryId"].as_u64().cmp(&a["entryId"].as_u64()))
+    });
+    json_response(serde_json::json!({ "items": items }))
+}
+
 
 fn sse_stream(app: &App) -> Response<Body> {
     let rx = app.store.tx.subscribe();
