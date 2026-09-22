@@ -47,8 +47,10 @@ fn raw_json(b: &Option<Vec<u8>>) -> serde_json::Value {
 pub struct WsMessage {
     pub dir: &'static str,     // c2s / s2c
     pub kind: String,          // text / binary / ping / pong / close
-    pub size: usize,
-    pub data: Option<String>,  // 文本内容（截断至 4KB）
+    pub size: usize,           // payload 原始字节数
+    pub data: Option<String>,  // 文本内容（超出连接总额度时截断）
+    /// 文本内容是否被截断（`data` 不完整，仅前若干字节）
+    pub truncated: bool,
     pub ts: u128,
 }
 
@@ -78,6 +80,8 @@ pub struct EntryInner {
     pub done: bool,
     pub ws_messages: Vec<WsMessage>,
     pub ws_closed: bool,
+    /// 本连接已保留的 WS 文本字节数（用于总额度控制，见 `ws::WS_TEXT_BUDGET`）
+    pub ws_text_used: usize,
     pub tcp_hex: Option<String>,
     pub bytes_up: u64,
     pub bytes_down: u64,
@@ -179,6 +183,7 @@ impl Store {
                 done: false,
                 ws_messages: Vec::new(),
                 ws_closed: false,
+                ws_text_used: 0,
                 tcp_hex: None,
                 bytes_up: 0,
                 bytes_down: 0,

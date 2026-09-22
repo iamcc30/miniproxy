@@ -62,46 +62,54 @@ impl FrameParser {
     }
 }
 
-fn make_message(dir: &'static str, opcode: u8, payload: &[u8]) -> WsMessage {
+/// 单条连接保留的 WS 文本总预算：超出后后续正文本体不再入库（仅记大小 + 截断标记）。
+/// 之所以按「连接」而不是「单条消息」限制：像 `response.create` 这种一次几十 KB 的
+/// JSON 逐帧都要看，但一条连接几十 MB 的日志也没有全存的必要。
+pub const WS_TEXT_BUDGET: usize = 8 * 1024 * 1024;
+
+/// 从 payload 中取可展示文本。
+/// `budget` 为本次还能用的字节数；超出则按 UTF-8 字符边界安全截断。
+/// 返回 `(文本, 实际占用字节数, 是否截断)`。
+fn take_text(payload: &[u8], budget: usize) -> (String, usize, bool) {
+    if payload.len() <= budget {
+        return (String::from_utf8_lossy(payload).to_string(), payload.len(), false);
+    }
+    // 从 budget 处往回退到字符边界，避免把多字节字符切成半个
+    let mut end = budget;
+    while end > 0 && (payload[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    (String::from_utf8_lossy(&payload[..end]).to_string(), end, true)
+}
+
+fn make_message(dir: &'static str, opcode: u8, payload: &[u8], budget: usize) -> (WsMessage, usize) {
     let now = crate::capture::now_ms();
+    let msg = |kind: &str, data: Option<String>, truncated: bool| WsMessage {
+        dir,
+        kind: kind.to_string(),
+        size: payload.len(),
+        data,
+        truncated,
+        ts: now,
+    };
     match opcode {
-        1 => WsMessage {
-            dir,
-            kind: "text".into(),
-            size: payload.len(),
-            data: Some(String::from_utf8_lossy(payload).chars().take(4096).collect()),
-            ts: now,
-        },
-        2 => WsMessage {
-            dir,
-            kind: "binary".into(),
-            size: payload.len(),
-            data: None,
-            ts: now,
-        },
+        1 => {
+            let (text, used, cut) = take_text(payload, budget);
+            (msg("text", Some(text), cut), used)
+        }
+        2 => (msg("binary", None, false), 0),
         8 => {
             let code = if payload.len() >= 2 {
                 format!("code={}", u16::from_be_bytes([payload[0], payload[1]]))
             } else {
                 String::new()
             };
-            WsMessage {
-                dir,
-                kind: format!("close{}", if code.is_empty() { "" } else { " " }),
-                size: payload.len(),
-                data: if code.is_empty() { None } else { Some(code) },
-                ts: now,
-            }
+            let kind = format!("close{}", if code.is_empty() { "" } else { " " });
+            (msg(&kind, if code.is_empty() { None } else { Some(code) }, false), 0)
         }
-        9 => WsMessage { dir, kind: "ping".into(), size: payload.len(), data: None, ts: now },
-        10 => WsMessage { dir, kind: "pong".into(), size: payload.len(), data: None, ts: now },
-        _ => WsMessage {
-            dir,
-            kind: format!("opcode-{}", opcode),
-            size: payload.len(),
-            data: None,
-            ts: now,
-        },
+        9 => (msg("ping", None, false), 0),
+        10 => (msg("pong", None, false), 0),
+        _ => (msg(&format!("opcode-{}", opcode), None, false), 0),
     }
 }
 
@@ -153,19 +161,35 @@ where
                     for (op, payload) in events {
                         // 续帧：尝试合并到上一条同方向消息
                         if op == 0 {
-                            if let Some(last) = inner.ws_messages.iter_mut().rev().find(|m| m.dir == dir && (m.kind == "text" || m.kind == "binary")) {
+                            let budget = WS_TEXT_BUDGET.saturating_sub(inner.ws_text_used);
+                            let mut consumed = 0usize;
+                            let mut merged = false;
+                            if let Some(last) = inner.ws_messages.iter_mut().rev().find(|m| {
+                                m.dir == dir && (m.kind == "text" || m.kind == "binary")
+                            }) {
                                 last.size += payload.len();
-                                if last.kind == "text" && last.data.is_some() {
-                                    let extra = String::from_utf8_lossy(&payload);
-                                    let cur = last.data.clone().unwrap_or_default();
-                                    if cur.len() < 4096 {
-                                        last.data = Some(format!("{}{}", cur, extra).chars().take(4096).collect());
+                                if last.kind == "text" {
+                                    let (extra, used, cut) = take_text(&payload, budget);
+                                    if !extra.is_empty() {
+                                        let cur = last.data.take().unwrap_or_default();
+                                        last.data = Some(format!("{}{}", cur, extra));
+                                        consumed = used;
+                                    }
+                                    if cut {
+                                        last.truncated = true;
                                     }
                                 }
+                                merged = true;
+                            }
+                            if merged {
+                                inner.ws_text_used += consumed;
                                 continue;
                             }
                         }
-                        inner.ws_messages.push(make_message(dir, op, &payload));
+                        let budget = WS_TEXT_BUDGET.saturating_sub(inner.ws_text_used);
+                        let (m, used) = make_message(dir, op, &payload, budget);
+                        inner.ws_text_used += used;
+                        inner.ws_messages.push(m);
                     }
                 }
             }
