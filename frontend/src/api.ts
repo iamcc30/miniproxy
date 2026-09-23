@@ -707,6 +707,16 @@ export interface VideoItem {
   rangeGroup?: boolean;
   /** 配对成功的音频轨条目：存在时下载走 /fullmux（音视频合并成一个 mp4） */
   audioEntryId?: number | null;
+  /** sabr 专属：重组时选中的视频/音频 itag（0 = 无音频轨） */
+  videoItag?: number;
+  audioItag?: number;
+  /**
+   * sabr 专属：已抓到的时长。SABR 没有 manifest 可枚举全集，
+   * 浏览器没播到的分段不会经过代理，所以这个值常小于 durationSec（视频全长）。
+   */
+  capturedSec?: number | null;
+  /** sabr 专属：sequence_number 是否自 1 连续（false = 浏览器没请求到中间某段） */
+  complete?: boolean;
 }
 
 export async function fetchVideos(): Promise<VideoItem[]> {
@@ -724,6 +734,10 @@ export async function fetchVideos(): Promise<VideoItem[]> {
  * - 其余走 /fullvideo（源站重拉）。
  */
 export function videoDownloadUrl(v: VideoItem): string {
+  // YouTube SABR：没有 manifest 也没有可重拉的整文件，只能重组已抓到的 UMP 分段
+  if (v.kind === 'sabr') {
+    return '/api/entries/' + v.entryId + '/umpsave';
+  }
   if (v.audioEntryId) {
     return '/api/entries/' + v.entryId + '/fullmux?a=' + v.audioEntryId;
   }

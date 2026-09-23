@@ -1053,7 +1053,9 @@ export default function App() {
           <div className="video-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="视频下载器">
             <div className="video-modal-head">
               <span className="sub-title" style={{ margin: 0 }}>🎬 视频下载</span>
-              <span className="video-hint">来自本次抓包 · 只列出可完整获取的视频</span>
+              <span className="video-hint">
+                来自本次抓包 · YouTube 走 SABR 私有协议（拿不到直链），只能重组浏览器已缓冲的分段
+              </span>
               <div className="spacer" />
               <button type="button" className="btn" onClick={loadVideos}>↻ 刷新</button>
               <button type="button" className="btn" onClick={() => setVideoOpen(false)}>×</button>
@@ -1068,6 +1070,9 @@ export default function App() {
                   <div style={{ fontSize: 32 }}>🎬</div>
                   <div>还没抓到可下载的完整视频</div>
                   <div>播放一次视频（直播除外）让分段被抓全，再点「刷新」</div>
+                  <div className="sabr-gap" style={{ marginTop: 6 }}>
+                    YouTube 需从 0 开始完整播一遍：初始化段只在开头下发一次，缺了它就拼不成片
+                  </div>
                 </div>
               )}
               {videos !== null && videos.length > 0 && (
@@ -1075,20 +1080,42 @@ export default function App() {
                   {videos.map((v) => (
                     <div key={`${v.kind}-${v.entryId}`} className="video-row">
                       <span className={`video-kind kind-${v.kind}`}>
-                        {v.kind === 'hls' ? 'HLS' : v.kind === 'dash' ? (v.rangeGroup ? '分块' : '分段') : '直链'}
+                        {v.kind === 'hls'
+                          ? 'HLS'
+                          : v.kind === 'dash'
+                            ? v.rangeGroup
+                              ? '分块'
+                              : '分段'
+                            : v.kind === 'sabr'
+                              ? 'SABR'
+                              : '直链'}
                       </span>
                       <div className="video-main">
                         <div className="video-name" title={v.url}>{v.name}</div>
                         <div className="video-meta">
                           <span title="来源域名">{v.host}</span>
                           {v.resolution && <span title="分辨率">{v.resolution}</span>}
-                          {v.durationSec != null && <span title="时长">{formatDuration(v.durationSec)}</span>}
+                          {v.durationSec != null && (
+                            <span title={v.kind === 'sabr' ? '已抓到时长 / 视频全长' : '时长'}>
+                              {v.kind === 'sabr' && v.capturedSec != null
+                                ? `已抓 ${formatDuration(v.capturedSec)} / 全长 ${formatDuration(v.durationSec)}`
+                                : formatDuration(v.durationSec)}
+                            </span>
+                          )}
                           {v.size != null && (
                             <span title={v.sizeExact ? '精确大小' : '按已捕获分段估算'}>
                               {v.sizeExact ? '' : '≈'}{formatBytes(v.size)}
                             </span>
                           )}
                           {v.segments != null && <span title="已捕获分段数">{v.segments} 段</span>}
+                          {v.kind === 'sabr' && v.complete === false && (
+                            <span
+                              className="sabr-gap"
+                              title="sequence_number 不连续：浏览器没有请求中间某些分段，成片会缺一小段"
+                            >
+                              分段不连续
+                            </span>
+                          )}
                         </div>
                       </div>
                       <a
@@ -1096,11 +1123,13 @@ export default function App() {
                         href={videoDownloadUrl(v)}
                         download
                         title={
-                          v.audioEntryId
-                            ? '分别拉取音视频轨并用 ffmpeg 合并为一个 mp4'
-                            : v.kind === 'dash' && !v.rangeGroup
-                              ? '拼接已捕获的分段并下载'
-                              : '从源站重新拉取完整视频'
+                          v.kind === 'sabr'
+                            ? '重组已抓到的 YouTube 分段（SABR/UMP）并用 ffmpeg 合并 · 只包含浏览器缓冲过的部分'
+                            : v.audioEntryId
+                              ? '分别拉取音视频轨并用 ffmpeg 合并为一个 mp4'
+                              : v.kind === 'dash' && !v.rangeGroup
+                                ? '拼接已捕获的分段并下载'
+                                : '从源站重新拉取完整视频'
                         }
                       >
                         ⬇ 下载

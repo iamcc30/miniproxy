@@ -716,6 +716,9 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
 .video-kind.kind-file { background: rgba(79, 110, 247, 0.14); color: var(--primary); }
 .video-kind.kind-hls { background: rgba(15, 181, 166, 0.14); color: var(--accent); }
 .video-kind.kind-dash { background: rgba(184, 134, 11, 0.16); color: var(--st-3xx); }
+/* YouTube SABR/UMP：私有协议、只能重组已缓冲分段，用警示色区分 */
+.video-kind.kind-sabr { background: rgba(220, 90, 90, 0.16); color: #e07a6a; }
+.sabr-gap { color: #e07a6a; }
 .video-main { flex: 1; min-width: 0; }
 .video-name {
   font-size: var(--text-sm); font-weight: 600; color: var(--text-primary);

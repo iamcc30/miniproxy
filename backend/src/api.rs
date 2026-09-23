@@ -48,6 +48,9 @@ pub async fn handle_api(
         (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/fullmux") => {
             return Ok(entry_fullmux(req, app.clone(), p).await)
         }
+        (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/umpsave") => {
+            return Ok(entry_umpsave(app.clone(), p).await)
+        }
         (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/body") => {
             entry_body(req, &app, p)
         }
@@ -1030,6 +1033,256 @@ async fn entry_fullmux(req: Request<Body>, app: Arc<App>, path: &str) -> Respons
         .unwrap()
 }
 
+/// 把一条 SABR 轨道（init + 递增序号的媒体段）写成文件。
+async fn write_sabr_track(path: &std::path::Path, t: &SabrTrack) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::File::create(path).await.map_err(|e| e.to_string())?;
+    let mut total = 0u64;
+    if let Some(init) = &t.init {
+        f.write_all(init).await.map_err(|e| e.to_string())?;
+        total += init.len() as u64;
+    }
+    for data in t.segs.values() {
+        f.write_all(data).await.map_err(|e| e.to_string())?;
+        total += data.len() as u64;
+    }
+    f.flush().await.map_err(|e| e.to_string())?;
+    Ok(total)
+}
+
+/// SABR 下载端点：`GET /api/entries/:id/umpsave`。
+///
+/// 以该条目所属的 video_id 为线索，把 store 里所有同视频的 UMP 分段重组为完整轨道，
+/// 需要时用 ffmpeg 把音视频合成一个文件回传。容器选择：
+/// 视频轨与音频轨都是 mp4 → mp4（带 faststart）；任一为 WebM → mkv（AV1/VP9+opus 才装得下）。
+///
+/// 局限：SABR 没有 manifest 可以枚举全部分段，只能重组**浏览器已经请求过**的分段，
+/// 因此用户播放到哪里就抓到哪里的内容。
+async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
+    use std::collections::BTreeMap;
+
+    let id = path
+        .trim_start_matches("/api/entries/")
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok());
+    let Some(id) = id else { return not_found() };
+    let Some(entry) = app.store.find(id) else {
+        return not_found();
+    };
+
+    // 1) 由该条目确定 video_id
+    let Some(probe) = body_of(&entry, "resp") else {
+        return json_error(StatusCode::BAD_REQUEST, "该条目没有响应正文");
+    };
+    let mut probe_tracks = BTreeMap::new();
+    let Some(video_id) = ump_absorb(&probe, &mut probe_tracks) else {
+        return json_error(StatusCode::BAD_REQUEST, "该条目不是 YouTube UMP（SABR）流");
+    };
+    drop(probe_tracks);
+
+    // 2) 扫描 store，合并同一 video_id 的全部分段
+    let mut tracks: BTreeMap<u32, SabrTrack> = BTreeMap::new();
+    {
+        let list = app.store.entries.lock().unwrap();
+        for e in list.iter() {
+            if e.kind != "http" {
+                continue;
+            }
+            let (ct, status) = {
+                let inner = e.inner.lock().unwrap();
+                (inner.content_type.clone(), inner.resp_status)
+            };
+            let is_ump = ct
+                .as_deref()
+                .map(|c| c.to_lowercase().contains("vnd.yt-ump"))
+                .unwrap_or(false);
+            if !is_ump || !matches!(status, Some(s) if (200..300).contains(&s)) {
+                continue;
+            }
+            // body_of 会锁 e.inner，必须放在上面那个块外面（std Mutex 不可重入）
+            let Some(body) = body_of(e, "resp") else {
+                continue;
+            };
+            let mut t = BTreeMap::new();
+            if ump_absorb(&body, &mut t).as_deref() != Some(video_id.as_str()) {
+                continue;
+            }
+            sabr_merge_tracks(&mut tracks, t);
+        }
+    }
+
+    // 3) 选轨：视频按像素面积（并列看字节数），音频按字节数
+    let mut vitag: Option<u32> = None;
+    let mut vscore: (u64, u64) = (0, 0);
+    for (itag, t) in &tracks {
+        // 和列表侧同样的约束：没有 init 段就无法成片
+        if !itag_is_video(*itag) || t.segs.is_empty() || t.init.is_none() {
+            continue;
+        }
+        let res = t
+            .init
+            .as_deref()
+            .and_then(mp4_resolution)
+            .map(|(w, h)| format!("{}x{}", w, h));
+        let score = (res_area(&res), t.segs.values().map(|b| b.len() as u64).sum::<u64>());
+        if score > vscore {
+            vscore = score;
+            vitag = Some(*itag);
+        }
+    }
+    let Some(vitag) = vitag else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "没有完整的视频轨：需要浏览器请求过初始化段（从头开始播放一次即可）",
+        );
+    };
+    let v_webm = track_is_webm(tracks[&vitag].init.as_ref());
+    // 音频优先挑与视频同容器的轨道：fMP4 视频 + mp4 音频能直接出 .mp4，
+    // 混到 WebM/opus 就只能出 .mkv；同容器再按体积（≈码率）取大的。
+    let aitag = tracks
+        .iter()
+        .filter(|(i, t)| !itag_is_video(**i) && !t.segs.is_empty() && t.init.is_some())
+        .map(|(i, t)| {
+            let w = track_is_webm(t.init.as_ref());
+            (*i, t.segs.values().map(|b| b.len() as u64).sum::<u64>(), w)
+        })
+        .min_by_key(|(_, b, w)| (if v_webm { !*w } else { *w }, std::cmp::Reverse(*b)))
+        .map(|(i, _, _)| i);
+
+    let a_webm = match aitag {
+        Some(a) => track_is_webm(tracks[&a].init.as_ref()),
+        None => false,
+    };
+    // AV1/VP9 + opus 只有 mkv 装得下；纯 mp4 轨则保留 mp4
+    let out_ext = if aitag.is_none() {
+        if v_webm { "webm" } else { "mp4" }
+    } else if v_webm || a_webm {
+        "mkv"
+    } else {
+        "mp4"
+    };
+
+    // 4) 落临时文件
+    let dir = std::env::temp_dir().join(format!("miniproxy-sabr-{}-{}", std::process::id(), id));
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("创建临时目录失败: {}", e));
+    }
+    let cleanup = |d: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(d);
+    };
+
+    let vfile = dir.join(if v_webm { "video.webm" } else { "video.mp4" });
+    if let Err(e) = write_sabr_track(&vfile, &tracks[&vitag]).await {
+        cleanup(&dir);
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("写出视频轨失败: {}", e));
+    }
+    let mut afile: Option<std::path::PathBuf> = None;
+    if let Some(a) = aitag {
+        let p = dir.join(if a_webm { "audio.webm" } else { "audio.mp4" });
+        if let Err(e) = write_sabr_track(&p, &tracks[&a]).await {
+            cleanup(&dir);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("写出音频轨失败: {}", e));
+        }
+        afile = Some(p);
+    }
+
+    // 5) 合并（无音频轨时视频轨即成品）
+    let ofile = dir.join(format!("out.{}", out_ext));
+    match &afile {
+        Some(af) => {
+            let Some(ffmpeg) = find_ffmpeg() else {
+                cleanup(&dir);
+                return json_error(StatusCode::NOT_IMPLEMENTED, "未找到 ffmpeg，无法合并音视频");
+            };
+            let mut cmd = tokio::process::Command::new(&ffmpeg);
+            cmd.arg("-y").arg("-i").arg(&vfile).arg("-i").arg(af).args(["-c", "copy"]);
+            if out_ext == "mp4" {
+                cmd.args(["-movflags", "+faststart"]);
+            }
+            let status = cmd
+                .arg(&ofile)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    cleanup(&dir);
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("ffmpeg 合并失败（exit {}），轨道格式可能不受支持", s),
+                    );
+                }
+                Err(e) => {
+                    cleanup(&dir);
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("启动 ffmpeg 失败: {}", e));
+                }
+            }
+        }
+        None => {
+            if let Err(e) = tokio::fs::rename(&vfile, &ofile).await {
+                cleanup(&dir);
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("整理输出文件失败: {}", e));
+            }
+        }
+    }
+
+    // 6) 流式回传
+    let name = format!("youtube_{}.{}", video_id, out_ext);
+    let ctype = match out_ext {
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "video/mp4",
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let ofile2 = ofile.clone();
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        match std::fs::File::open(&ofile2) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.blocking_send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir2);
+    });
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, ctype)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", name),
+        )
+        .body(Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+        .unwrap()
+}
+
 fn json_response(v: serde_json::Value) -> Response<Body> {
     Response::builder()
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
@@ -1148,9 +1401,8 @@ fn list_types(app: &App) -> Response<Body> {
 
 /// MP4 解析：在字节里找 moov/tkhd，取面积最大的视频轨宽高（16.16 定点存储）。
 /// 只读不猜：找不到 moov（如存储被截断）就返回 None。
-fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
-    /// 遍历一层 box：返回 (类型, payload)。兼容 64 位 largesize 与 size==0（到文件尾）。
-    fn boxes(b: &[u8]) -> Vec<(&[u8], &[u8])> {
+/// 遍历一层 box：返回 (类型, payload)。兼容 64 位 largesize 与 size==0（到文件尾）。
+fn mp4_boxes(b: &[u8]) -> Vec<(&[u8], &[u8])> {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + 8 <= b.len() {
@@ -1180,7 +1432,9 @@ fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
             i = end;
         }
         out
-    }
+}
+
+fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
     /// 只有这些容器盒才值得下钻（tkhd 就挂在 moov → trak 下）。
     /// 必须白名单：正文被截断时，mdat 里的随机字节会被误读成 box 头，
     /// 若见 box 就递归，遇到伪造的 largesize(size==1) 时每层只前进 16 字节，
@@ -1205,7 +1459,7 @@ fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
         if depth > 8 {
             return;
         }
-        for (t, payload) in boxes(b) {
+        for (t, payload) in mp4_boxes(b) {
             if t == b"tkhd" {
                 out.push(payload.to_vec());
             }
@@ -1229,6 +1483,52 @@ fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
         }
     }
     best.map(|(_, w, h)| (w, h))
+}
+
+/// 从 MP4 初始化段（ftyp+moov）读总时长（秒）：moov → mvhd。
+/// mvhd 布局：version(1) flags(3) [creation modification](4 或 8) timescale(4) duration(4 或 8)，
+/// v1 的时间字段是 8 字节、v0 是 4 字节，所以偏移随 version 变。
+fn mp4_duration(b: &[u8]) -> Option<f64> {
+    fn find_mvhd(b: &[u8], depth: u8) -> Option<Vec<u8>> {
+        if depth > 8 {
+            return None;
+        }
+        for (t, payload) in mp4_boxes(b) {
+            if t == b"mvhd" {
+                return Some(payload.to_vec());
+            }
+            if t == b"moov" {
+                if let Some(v) = find_mvhd(payload, depth + 1) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+    let p = find_mvhd(b, 0)?;
+    if p.len() < 4 {
+        return None;
+    }
+    let (timescale, duration) = if p[0] == 1 {
+        (
+            u32::from_be_bytes(p.get(20..24)?.try_into().ok()?),
+            u64::from_be_bytes(p.get(24..32)?.try_into().ok()?),
+        )
+    } else {
+        (
+            u32::from_be_bytes(p.get(12..16)?.try_into().ok()?),
+            u32::from_be_bytes(p.get(16..20)?.try_into().ok()?) as u64,
+        )
+    };
+    // duration 全 1 是「未知时长」的约定值
+    if timescale == 0
+        || duration == 0
+        || duration == u64::MAX
+        || duration == u32::MAX as u64
+    {
+        return None;
+    }
+    Some(duration as f64 / timescale as f64)
 }
 
 /// URL 路径（去 query）的小写扩展名
@@ -1327,11 +1627,320 @@ fn entry_is_hls(entry: &crate::capture::Entry) -> bool {
             .unwrap_or(false)
 }
 
+// ===================== YouTube SABR / UMP =====================
+//
+// YouTube 新版播放走 SABR：`POST /videoplayback?...&sabr=1`，URL 里没有 itag/range，
+// 轨道信息在 POST 请求体里，响应是私有 UMP 格式（Content-Type: application/vnd.yt-ump）。
+// 因此既不能按扩展名识别，也无法像 B 站那样整文件重拉——只能解析已抓到的响应。
+//
+// UMP 结构（参考 LuanRT/googlevideo 的 UmpReader / MediaHeader）：
+//   [partType: UMP 变长整数] [partSize: 同] [partSize 字节 payload]
+// UMP 变长整数按**首字节高位**决定宽度，与 protobuf 的 LEB128 不是一回事：
+//   0xxxxxxx→1B | 10xxxxxx→2B | 110xxxxx→3B | 1110xxxx→4B | 1111xxxx→5B(后 4 字节小端)
+// 媒体相关 part：
+//   20 MEDIA_HEADER → protobuf MediaHeader（itag / sequence_number / is_init_seg / content_length）
+//   21 MEDIA        → payload[0] = header_id，其余就是裸媒体字节（fMP4 或 WebM）
+//   22 MEDIA_END    → payload[0] = header_id
+// header_id 只在单个响应内唯一，所以“MEDIA 归属哪个 MediaHeader”必须逐响应关联。
+
+/// UMP 变长整数（首字节高位标记宽度）。
+fn ump_varint(b: &[u8], off: usize) -> Option<(u64, usize)> {
+    let f = *b.get(off)? as u64;
+    if f < 128 {
+        Some((f, off + 1))
+    } else if f < 192 {
+        Some(((f & 0x3f) + 64 * (*b.get(off + 1)? as u64), off + 2))
+    } else if f < 224 {
+        Some((
+            (f & 0x1f) + 32 * (*b.get(off + 1)? as u64 + 256 * (*b.get(off + 2)? as u64)),
+            off + 3,
+        ))
+    } else if f < 240 {
+        Some((
+            (f & 0x0f)
+                + 16
+                    * (*b.get(off + 1)? as u64
+                        + 256 * (*b.get(off + 2)? as u64 + 256 * (*b.get(off + 3)? as u64))),
+            off + 4,
+        ))
+    } else {
+        let s = b.get(off + 1..off + 5)?;
+        Some((u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64, off + 5))
+    }
+}
+
+/// protobuf 标准 LEB128 varint（MediaHeader 内部用的是标准编码，不是 UMP 那套）。
+fn pb_varint(b: &[u8], off: usize) -> Option<(u64, usize)> {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    let mut i = off;
+    loop {
+        let c = *b.get(i)?;
+        i += 1;
+        v |= ((c & 0x7f) as u64) << shift;
+        if c & 0x80 == 0 {
+            return Some((v, i));
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct UmpHeader {
+    header_id: u64,
+    itag: u32,
+    is_init: bool,
+    seq: Option<i64>,
+    content_length: Option<i64>,
+    duration_ms: i64,
+    video_id: Option<String>,
+}
+
+/// 解析 MediaHeader 的 protobuf（只取关心的字段）。
+fn ump_parse_header(p: &[u8]) -> Option<UmpHeader> {
+    let mut h = UmpHeader::default();
+    let mut i = 0usize;
+    while i < p.len() {
+        let (tag, ni) = pb_varint(p, i)?;
+        i = ni;
+        let field = tag >> 3;
+        match tag & 7 {
+            0 => {
+                let (v, ni) = pb_varint(p, i)?;
+                i = ni;
+                match field {
+                    1 => h.header_id = v,
+                    3 => h.itag = v as u32,
+                    8 => h.is_init = v != 0,
+                    9 => h.seq = Some(v as i64),
+                    12 => h.duration_ms = v as i64,
+                    14 => h.content_length = Some(v as i64),
+                    _ => {}
+                }
+            }
+            2 => {
+                let (l, ni) = pb_varint(p, i)?;
+                if field == 2 {
+                    if let Some(s) = p.get(ni..ni.saturating_add(l as usize)) {
+                        h.video_id = Some(String::from_utf8_lossy(s).to_string());
+                    }
+                }
+                i = ni.saturating_add(l as usize);
+            }
+            5 => i = i.saturating_add(4),
+            1 => i = i.saturating_add(8),
+            _ => return None,
+        }
+    }
+    Some(h)
+}
+
+/// 该 UMP 媒体载荷是否为轨道初始化段（提供解码参数的那一段）。
+///
+/// 判据必须精确，因为**媒体的普通分片和 init 段长得很像**：
+/// - fMP4：init 以 `ftyp` 开头，媒体分片以 `moof` 开头 → 看魔数即可；
+/// - WebM：init 以 **EBML 头（1A45DFA3）** 开头并含 `Tracks` 元素（0x1654AE6B，声明
+///   编解码器参数），而媒体分片以 **Cluster（1F43B675）** 开头。两者前 4 字节完全不同，
+///   所以「EBML 头开头」本身就是有效判据；再要求含 `Tracks` 是为了多上一道保险。
+fn looks_like_init(data: &[u8]) -> bool {
+    if data.get(4..8).map(|s| s == b"ftyp").unwrap_or(false) {
+        return true;
+    }
+    if data.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        let n = data.len().min(64 * 1024);
+        let needle = [0x16u8, 0x54, 0xae, 0x6b];
+        return data[..n].windows(4).any(|w| w == needle);
+    }
+    false
+}
+
+/// 单个 itag 的轨道数据：init 段 + 按 sequence_number 排列的媒体段。
+#[derive(Default)]
+struct SabrTrack {
+    init: Option<Vec<u8>>,
+    segs: std::collections::BTreeMap<i64, Vec<u8>>,
+    /// seq → 该段时长（ms）。与 segs 同步去重，供统计「已抓到时长为多少」。
+    ///
+    /// 不能在合并轨道时取单个响应的累加值当总量：一个响应只带几个分段，
+    /// 各响应还会重复覆盖同一 seq，只有按 seq 去重后求和才是真实抓到的时长。
+    dur: std::collections::BTreeMap<i64, i64>,
+}
+
+impl SabrTrack {
+    /// 已抓到的总时长（秒）。断号时是「各段之和」而非首尾跨度，更贴近实际内容量。
+    fn captured_secs(&self) -> f64 {
+        self.dur.values().sum::<i64>() as f64 / 1000.0
+    }
+}
+
+/// 一条视频（按 video_id 聚合）的全部轨道。
+#[derive(Default)]
+struct SabrVideo {
+    video_id: String,
+    first_entry: u64,
+    host: String,
+    url: String,
+    tracks: std::collections::BTreeMap<u32, SabrTrack>,
+}
+
+/// 把一条 UMP 响应里的媒体并入轨道表；返回该响应涉及的 video_id。
+fn ump_absorb(body: &[u8], tracks: &mut std::collections::BTreeMap<u32, SabrTrack>) -> Option<String> {
+    let mut headers: std::collections::HashMap<u64, UmpHeader> = std::collections::HashMap::new();
+    let mut acc: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut video_id: Option<String> = None;
+    let mut off = 0usize;
+
+    while off < body.len() {
+        let Some((ptype, o2)) = ump_varint(body, off) else {
+            break;
+        };
+        let Some((psize, o3)) = ump_varint(body, o2) else {
+            break;
+        };
+        let end = o3.saturating_add(psize as usize);
+        if end > body.len() {
+            break; // 正文被截断，残段丢弃（不完整的媒体块绝不能混进拼接结果）
+        }
+        let payload = &body[o3..end];
+        off = end;
+        match ptype {
+            20 => {
+                if let Some(h) = ump_parse_header(payload) {
+                    if video_id.is_none() {
+                        if let Some(v) = &h.video_id {
+                            if !v.is_empty() {
+                                video_id = Some(v.clone());
+                            }
+                        }
+                    }
+                    headers.insert(h.header_id, h);
+                }
+            }
+            21 => {
+                if !payload.is_empty() {
+                    acc.entry(payload[0] as u64)
+                        .or_default()
+                        .extend_from_slice(&payload[1..]);
+                }
+            }
+            _ => {} // MEDIA_END 及各类策略 part 直接忽略
+        }
+    }
+
+    for (hid, data) in acc {
+        let Some(h) = headers.get(&hid) else { continue };
+        if h.itag == 0 {
+            continue;
+        }
+        let t = tracks.entry(h.itag).or_default();
+        // init 段必须以 ftyp（fMP4）或 EBML 头（WebM）开头。
+        // 不能只看 is_init / seq 缺失：部分媒体段的 MediaHeader 就是不带 sequence_number，
+        // 一旦把它当 init 写进去，就会顶掉真正的初始化段，分辨率和时长随之全读不出来。
+        if (h.is_init || h.seq.is_none()) && looks_like_init(&data) {
+            if t.init.as_ref().map(|v| v.len()).unwrap_or(0) < data.len() {
+                t.init = Some(data);
+            }
+        } else if let Some(seq) = h.seq {
+            if t.segs.insert(seq, data).is_none() && h.duration_ms > 0 {
+                t.dur.insert(seq, h.duration_ms);
+            }
+        }
+    }
+    video_id
+}
+
+/// 把一批轨道并入聚合结果（init 取最长，分段按 sequence_number 去重）。
+fn sabr_merge_tracks(
+    dst_tracks: &mut std::collections::BTreeMap<u32, SabrTrack>,
+    tracks: std::collections::BTreeMap<u32, SabrTrack>,
+) {
+    for (itag, t) in tracks {
+        let dst = dst_tracks.entry(itag).or_default();
+        let dst_len = dst.init.as_ref().map(|v| v.len()).unwrap_or(0);
+        let new_len = t.init.as_ref().map(|v| v.len()).unwrap_or(0);
+        if dst_len < new_len {
+            dst.init = t.init;
+        }
+        for (seq, ms) in t.dur {
+            dst.dur.insert(seq, ms);
+        }
+        for (seq, data) in t.segs {
+            dst.segs.insert(seq, data);
+        }
+    }
+}
+
+/// 把快照里的 UMP 响应按 video_id 聚合。复用快照已拷出的正文，不再二次读 store。
+fn sabr_scan(snaps: &[VidSnap]) -> Vec<SabrVideo> {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, SabrVideo> = BTreeMap::new();
+    for s in snaps {
+        let is_ump = s
+            .ct
+            .as_deref()
+            .map(|c| c.to_lowercase().contains("vnd.yt-ump"))
+            .unwrap_or(false);
+        if !is_ump {
+            continue;
+        }
+        let Some(body) = &s.body else { continue };
+        let mut tracks = BTreeMap::new();
+        let Some(vid) = ump_absorb(body, &mut tracks) else {
+            continue;
+        };
+        if tracks.is_empty() {
+            continue;
+        }
+        let slot = out.entry(vid.clone()).or_insert_with(|| SabrVideo {
+            video_id: vid.clone(),
+            first_entry: s.id,
+            host: s.host.clone(),
+            url: s.url.clone(),
+            tracks: BTreeMap::new(),
+        });
+        sabr_merge_tracks(&mut slot.tracks, tracks);
+    }
+    out.into_values().collect()
+}
+
+/// 轨道是否为 WebM（EBML 头），用来决定合并后的容器。
+fn track_is_webm(init: Option<&Vec<u8>>) -> bool {
+    init.map(|b| b.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])).unwrap_or(false)
+}
+
+/// 该 itag 是否为音频轨。
+///
+/// **不能用数值阈值猜**：YouTube 的视频 itag 跨度极大（137/248/264/271/399…），
+/// 任何「小于某值即音频」的假设都会错——实测 399 是 AV1 视频、251 是 opus 音频。
+/// 因此列举已知音频 itag，其余一律当视频。
+fn itag_is_audio(itag: u32) -> bool {
+    matches!(
+        itag,
+        139 | 140 | 141 | 171 | 172 | 249 | 250 | 251 | 256 | 258 | 325 | 328 | 338
+    )
+}
+
+fn itag_is_video(itag: u32) -> bool {
+    !itag_is_audio(itag)
+}
+
+/// "1920x1080" → 像素面积（用于挑最佳视频轨）。
+fn res_area(r: &Option<String>) -> u64 {
+    r.as_deref()
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(a, b)| Some(a.parse::<u64>().ok()? * b.parse::<u64>().ok()?))
+        .unwrap_or(0)
+}
+
 /// 视频下载器：把抓包条目聚合为「可完整获取」的视频列表。
-/// 三类来源（下载入口各不相同）：
+/// 四类来源（下载入口各不相同）：
 /// - file：独立音视频文件 → /fullvideo 整文件重拉，不受存储截断影响
 /// - hls：VOD m3u8（须见过 #EXT-X-ENDLIST，直播流排除）→ /fullvideo 实时拼段
 /// - dash：init 齐全的 fMP4 分段组（推特 .m4s / Range 分块）→ /stitch 拼接已捕获分段
+/// - sabr：YouTube UMP 流 → /umpsave 按 itag 重组已捕获分段
 fn list_videos(app: &App) -> Response<Body> {
     use std::collections::BTreeMap;
 
@@ -1350,11 +1959,17 @@ fn list_videos(app: &App) -> Response<Body> {
             }
             let ct = inner.content_type.clone();
             let ext = path_ext(&e.url);
+            // YouTube SABR 流的 Content-Type 是 application/vnd.yt-ump，扩展名也拿不到
+            // （URL 是 /videoplayback），必须单独放行，否则整类流量在第一步就被滤掉。
+            let is_ump = ct
+                .as_deref()
+                .map(|c| c.to_lowercase().contains("vnd.yt-ump"))
+                .unwrap_or(false);
             let ct_media = ct
                 .as_deref()
                 .map(|c| c.starts_with("video/") || c.starts_with("audio/") || c.to_lowercase().contains("mpegurl"))
                 .unwrap_or(false);
-            if !ct_media && !VIDEO_EXTS.contains(&ext.as_str()) && ext != "m4s" {
+            if !ct_media && !is_ump && !VIDEO_EXTS.contains(&ext.as_str()) && ext != "m4s" {
                 continue;
             }
             let total_len = inner.resp_headers.as_ref().and_then(|hs| {
@@ -1371,7 +1986,7 @@ fn list_videos(app: &App) -> Response<Body> {
             // 注意：body_of 会再次锁 e.inner，std Mutex 不可重入，
             // 必须先在本块里取完所有字段并释放 inner 锁，再拷正文
             let (body, body_full, size) = {
-                let need_body = ct_media || ext == "m4s" || ext == "ts" || ext == "mp4";
+                let need_body = ct_media || is_ump || ext == "m4s" || ext == "ts" || ext == "mp4";
                 let full = !inner.resp_truncated;
                 let sz = inner.resp_body.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
                 if need_body {
@@ -1589,6 +2204,14 @@ fn list_videos(app: &App) -> Response<Body> {
 
     // ---- 3. 独立媒体文件：排除 m4s 分段 / m3u8 / 已被 HLS 收编的同目录 ts、mp4 ----
     for s in &snaps {
+        // YouTube UMP 流交给下面的 SABR 分支单独聚合，这里不能当普通媒体文件罗列
+        if s.ct
+            .as_deref()
+            .map(|c| c.to_lowercase().contains("vnd.yt-ump"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let ext = path_ext(&s.url);
         if ext == "m3u8" || s.ct.as_deref().map(|c| c.to_lowercase().contains("mpegurl")).unwrap_or(false) {
             continue;
@@ -1774,6 +2397,99 @@ fn list_videos(app: &App) -> Response<Body> {
             "resolution": v.resolution, "durationSec": serde_json::Value::Null,
             "segments": v.segments, "rangeGroup": v.range_group,
             "audioEntryId": v.audio_entry_id,
+        }));
+    }
+
+    // ---- 4. YouTube SABR（UMP）：按 video_id 聚合已捕获的分段 ----
+    // 局限：只能重组浏览器已经请求过的分段，没有 manifest 可以枚举全集，
+    // 因此无法像 B 站那样整文件重拉；用户播放到哪就抓到哪。
+    for v in sabr_scan(&snaps) {
+        // 先选轨，再把体积/段数只按「将被下载的那两条轨」统计——同一视频常有
+        // 多档清晰度与多档音频，全量累加会把 size 报成虚高好几倍。
+        // (itag, 字节数, 分辨率)——视频按像素面积挑最佳，并列再看字节数
+        let mut best_video: Option<(u32, u64, Option<String>)> = None;
+        // 音频候选：(itag, 字节数, 是否 WebM/opus)
+        let mut audio_cands: Vec<(u32, u64, bool)> = Vec::new();
+        for (itag, t) in &v.tracks {
+            // 轨道必须同时具备 init 段与媒体段才能成片：init 提供解码参数
+            // （fMP4 的 moov / WebM 的 EBML 头），缺了它拼出来的文件播放器打不开。
+            if t.init.is_none() || t.segs.is_empty() {
+                continue;
+            }
+            let bytes = t.segs.values().map(|b| b.len() as u64).sum::<u64>();
+            if itag_is_video(*itag) {
+                // 分辨率读自 fMP4 的 init 段（moov→trak→tkhd）；WebM 轨读不到就留空
+                let res = t
+                    .init
+                    .as_deref()
+                    .and_then(mp4_resolution)
+                    .map(|(w, h)| format!("{}x{}", w, h));
+                let better = match &best_video {
+                    None => true,
+                    Some((_, bbytes, bres)) => {
+                        (res_area(&res), bytes) > (res_area(bres), *bbytes)
+                    }
+                };
+                if better {
+                    best_video = Some((*itag, bytes, res));
+                }
+            } else {
+                audio_cands.push((*itag, bytes, track_is_webm(t.init.as_ref())));
+            }
+        }
+        let Some((vitag, vbytes, resolution)) = best_video else {
+            continue;
+        };
+        let vtrack = &v.tracks[&vitag];
+        let v_webm = track_is_webm(vtrack.init.as_ref());
+        // 优先挑与视频同容器的音频：fMP4 视频 + mp4 音频能直接出 .mp4，
+        // 混到 WebM/opus 就只装得进 .mkv。同容器再按体积（≈码率）取大的。
+        audio_cands.sort_by_key(|(_, b, w)| (if v_webm { *w } else { !*w }, std::cmp::Reverse(*b)));
+        let best_audio = audio_cands.first().map(|(i, b, _)| (*i, *b));
+        let atrack = best_audio.and_then(|(a, _)| v.tracks.get(&a));
+        // 时长优先用 init 段 moov 里的权威总时长（fMP4 才有），读不到就退回已抓时长
+        let captured_secs = vtrack.captured_secs();
+        let duration = vtrack
+            .init
+            .as_deref()
+            .and_then(mp4_duration)
+            .or(if captured_secs > 0.0 {
+                Some(captured_secs)
+            } else {
+                None
+            });
+        // 实际抓到的时长：选中视频轨各段时长之和（按 sequence_number 去重）。
+        // SABR 没有 manifest 可枚举全集，浏览器没播到的段就不会经过代理，
+        // 所以「抓到 830s / 全长 1014s」是常态而非 bug。
+        let captured = if captured_secs > 0.0 {
+            Some(captured_secs)
+        } else {
+            None
+        };
+        // 分段连续性：sequence_number 应自 1 起连续（缺号 = 浏览器没请求到那一段）
+        let seqs: Vec<i64> = vtrack.segs.keys().copied().collect();
+        let complete = match (seqs.first(), seqs.last()) {
+            (Some(f), Some(l)) => *f == 1 && (*l - *f + 1) as usize == seqs.len(),
+            _ => false,
+        };
+        items.push(serde_json::json!({
+            "entryId": v.first_entry, "kind": "sabr",
+            "name": format!("youtube_{}", v.video_id),
+            "host": v.host, "url": v.url,
+            "size": vbytes + best_audio.map(|(_, b)| b).unwrap_or(0),
+            "sizeExact": true,
+            "resolution": resolution,
+            "durationSec": duration
+                .map(|d| serde_json::json!(d))
+                .unwrap_or(serde_json::Value::Null),
+            "capturedSec": captured
+                .map(|d| serde_json::json!(d))
+                .unwrap_or(serde_json::Value::Null),
+            "segments": seqs.len() + atrack.map(|t| t.segs.len()).unwrap_or(0),
+            "rangeGroup": false,
+            "videoItag": vitag,
+            "audioItag": best_audio.map(|(i, _)| i).unwrap_or(0),
+            "complete": complete,
         }));
     }
 
@@ -2166,4 +2882,191 @@ async fn upstream_scan(app: &App) -> Response<Body> {
         .map(|u| serde_json::json!({"addr": u.addr(), "reachable": true}))
         .collect();
     json_response(serde_json::json!({ "ok": true, "candidates": candidates }))
+}
+
+#[cfg(test)]
+mod sabr_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// 测试用的 UMP 变长整数编码（与 ump_varint 的解码规则互为逆运算）。
+    ///
+    /// 注意各宽度的位权重很反直觉：2 字节形式是 (首字节低 6 位) + 64×次字节，
+    /// 3 字节形式是 (首字节低 5 位) + 32×次字节 + 8192×第三字节。
+    fn uv_enc(v: u64) -> Vec<u8> {
+        if v < 128 {
+            vec![v as u8]
+        } else if v < 16384 {
+            vec![0x80 | (v & 0x3f) as u8, (v >> 6) as u8]
+        } else {
+            vec![
+                0xc0 | (v & 0x1f) as u8,
+                ((v >> 5) & 0xff) as u8,
+                (v >> 13) as u8,
+            ]
+        }
+    }
+
+    /// MediaHeader 内部字段用的是标准 protobuf LEB128，别和上面的 UMP 变长整数混用。
+    fn leb(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let c = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                out.push(c | 0x80);
+            } else {
+                out.push(c);
+                break;
+            }
+        }
+        out
+    }
+
+    /// protobuf 长度分隔字段
+    fn pb_len(field: u64, val: &[u8]) -> Vec<u8> {
+        let mut out = leb((field << 3) | 2);
+        out.extend_from_slice(&leb(val.len() as u64));
+        out.extend_from_slice(val);
+        out
+    }
+
+    /// protobuf varint 字段
+    fn pb_var(field: u64, val: u64) -> Vec<u8> {
+        let mut out = leb(field << 3);
+        out.extend_from_slice(&leb(val));
+        out
+    }
+
+    fn part(ptype: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = uv_enc(ptype);
+        out.extend_from_slice(&uv_enc(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 组装一个 MediaHeader。`seq = None` 表示不下发 sequence_number。
+    fn header(id: u64, itag: u64, is_init: bool, seq: Option<u64>, dur_ms: u64) -> Vec<u8> {
+        let mut h = pb_var(1, id);
+        h.extend(pb_len(2, b"tYvu6IpSfiM"));
+        h.extend(pb_var(3, itag));
+        if is_init {
+            h.extend(pb_var(8, 1));
+        }
+        if let Some(s) = seq {
+            h.extend(pb_var(9, s));
+            h.extend(pb_var(11, s * 7000));
+        }
+        h.extend(pb_var(12, dur_ms));
+        h
+    }
+
+    /// MEDIA part 的载荷 = header_id + 裸媒体字节
+    fn media(header_id: u8, bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![header_id];
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    const EBML: [u8; 4] = [0x1a, 0x45, 0xdf, 0xa3]; // WebM 初始化段开头
+    const TRACKS: [u8; 4] = [0x16, 0x54, 0xae, 0x6b];
+    const CLUSTER: [u8; 4] = [0x1f, 0x43, 0xb6, 0x75]; // WebM 媒体分片开头
+    const FTYP: [u8; 8] = [0, 0, 0, 0x1c, b'f', b't', b'y', b'p'];
+    const MOOF: [u8; 8] = [0, 0, 0x0d, 0x7c, b'm', b'o', b'o', b'f'];
+
+    #[test]
+    fn varint_roundtrip() {
+        for v in [0u64, 1, 127, 128, 300, 16383, 16384, 200000, 262143] {
+            let e = uv_enc(v);
+            let (got, n) = ump_varint(&e, 0).expect("decode");
+            assert_eq!(got, v, "值 {} 编码 {:?}", v, e);
+            assert_eq!(n, e.len());
+        }
+    }
+
+    #[test]
+    fn itag_kind() {
+        // 实测结论：399 是 AV1 视频、251 是 opus 音频，不能用数值大小猜
+        assert!(itag_is_video(399) && itag_is_video(137) && itag_is_video(271));
+        assert!(itag_is_audio(251) && itag_is_audio(140) && itag_is_audio(249));
+    }
+
+    #[test]
+    fn init_段识别() {
+        let mut webm_init = EBML.to_vec();
+        webm_init.extend_from_slice(&[0u8; 60]); // EBML 头 + 段头
+        webm_init.extend_from_slice(&TRACKS);
+        assert!(looks_like_init(&webm_init), "EBML 头 + Tracks 是 WebM init");
+
+        let mut webm_media = CLUSTER.to_vec();
+        webm_media.extend_from_slice(&[0u8; 4000]);
+        assert!(!looks_like_init(&webm_media), "Cluster 开头的普通分片不是 init");
+
+        let mut ebml_no_tracks = EBML.to_vec();
+        ebml_no_tracks.extend_from_slice(&[0u8; 4000]);
+        assert!(
+            !looks_like_init(&ebml_no_tracks),
+            "缺 Tracks 的载荷不能顶掉真正的初始化段"
+        );
+
+        assert!(looks_like_init(&FTYP), "fMP4 init 以 ftyp 开头");
+        assert!(!looks_like_init(&MOOF), "moof 开头的普通分片不是 init");
+    }
+
+    #[test]
+    fn 聚合轨道() {
+        let mut webm_init = media(0, &{
+            let mut v = EBML.to_vec();
+            v.extend_from_slice(&[0u8; 60]);
+            v.extend_from_slice(&TRACKS);
+            v.extend_from_slice(&[0u8; 1900]);
+            v
+        });
+        let mut body = part(20, &header(0, 251, true, None, 0));
+        body.extend(part(21, &webm_init));
+
+        let mut cluster = CLUSTER.to_vec();
+        cluster.extend_from_slice(&[7u8; 130_000]);
+        let med = media(1, &cluster);
+        body.extend(part(20, &header(1, 251, false, Some(1), 10_000)));
+        body.extend(part(21, &med));
+        body.extend(part(22, &[1]));
+
+        // 视频：init(fMP4) + 一个 moof 分片
+        let mut vinit = FTYP.to_vec();
+        vinit.extend_from_slice(&[0u8; 2704]);
+        body.extend(part(20, &header(2, 399, true, None, 0)));
+        body.extend(part(21, &media(2, &vinit)));
+        let mut moof = MOOF.to_vec();
+        moof.extend_from_slice(&[9u8; 60_000]);
+        body.extend(part(20, &header(3, 399, false, Some(1), 7_000)));
+        body.extend(part(21, &media(3, &moof)));
+        body.extend(part(22, &[3]));
+
+        // 一段「无 sequence_number 但以 EBML 头开头、不含 Tracks」的载荷：
+        // 老实现会把它当 init，从而顶掉真正的初始化段
+        let trap = media(4, &{
+            let mut v = EBML.to_vec();
+            v.extend_from_slice(&[3u8; 5000]);
+            v
+        });
+        body.extend(part(20, &header(4, 251, false, None, 0)));
+        body.extend(part(21, &trap));
+
+        let mut tracks: BTreeMap<u32, SabrTrack> = BTreeMap::new();
+        let vid = ump_absorb(&body, &mut tracks);
+        assert_eq!(vid.as_deref(), Some("tYvu6IpSfiM"));
+
+        let a = tracks.get(&251).expect("音频轨");
+        let init = a.init.as_ref().expect("音频 init");
+        assert!(init.starts_with(&EBML) && init.windows(4).any(|w| w == TRACKS));
+        assert_eq!(a.segs.len(), 1, "音频只有 1 个带序号的媒体段");
+        assert_eq!(a.captured_secs(), 10.0);
+
+        let v = tracks.get(&399).expect("视频轨");
+        assert!(v.init.as_ref().unwrap().starts_with(&FTYP));
+        assert_eq!(v.segs.len(), 1);
+        assert_eq!(v.captured_secs(), 7.0);
+        assert_eq!(v.segs.keys().copied().collect::<Vec<_>>(), vec![1]);
+    }
 }
