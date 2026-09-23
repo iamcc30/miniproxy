@@ -16,10 +16,22 @@ FFPROBE=/opt/homebrew/bin/ffprobe
 mkdir -p "$OUT"
 
 echo "== 1/4 探上游 =="
-code=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' -m 8 -x "http://$UP" https://www.youtube.com/)
-echo "   $UP -> $code"
+# ⚠️ 探上游时**不能**加 --noproxy '*'：它的语义是「所有主机都绕过代理」，
+#    优先级高于 -x，会把请求变成直连 —— 那测的就不是上游了（本项目踩过这个坑）。
+#    环境里若有 http_proxy（沙箱 / 公司代理），用 env -u 显式清掉以免干扰。
+#    ⚠️ 反过来，下面访问本机 API(127.0.0.1:9000) 的 curl 必须加 --noproxy '*'，
+#    否则会被环境代理劫持走。
+# 上游对 YouTube 可能间歇可用，所以重试几次再判定失败。
+code=""
+for i in 1 2 3; do
+  code=$(env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+         curl -s -o /dev/null -w '%{http_code}' -m 10 -x "http://$UP" https://www.youtube.com/)
+  echo "   第 $i 次 $UP -> $code"
+  [ "$code" = "200" ] && break
+  sleep 2
+done
 if [ "$code" != "200" ]; then
-  echo "   上游对 YouTube 不通（注意：能通百度不代表能通谷歌），等代理节点恢复后重跑。"
+  echo "   上游对 YouTube 不通（能通百度不代表能通谷歌），等代理节点恢复后重跑。"
   exit 1
 fi
 

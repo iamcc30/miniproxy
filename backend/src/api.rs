@@ -2186,7 +2186,10 @@ fn sabr_replay_once(url: &str, body: &[u8], proxy: Option<&str>) -> Result<Vec<u
     let res = (|| -> Result<Vec<u8>, String> {
         std::fs::write(&inp, body).map_err(|e| e.to_string())?;
         let mut cmd = std::process::Command::new("curl");
-        cmd.args(["-s", "--max-time", "45", "-X", "POST", "-o"]).arg(&outp);
+        // 单次回放超时 20s：上游对 googlevideo 是间歇可用的，失败请求原本要干等满
+        // 45s，把整轮耗时从 3s 拉到 12s+（实测均 9004ms/请求）。成功请求实测 2-3s
+        // 就返回，20s 足够，宁可快速失败换候选重试。
+        cmd.args(["-s", "--max-time", "20", "-X", "POST", "-o"]).arg(&outp);
         // 隔离外部代理环境变量：curl 会读 http_proxy/https_proxy/all_proxy，
         // 若本进程是从带这些变量的 shell 里起来的，补拉会被悄悄改道（甚至劫持到
         // 别的代理上）；显式 --proxy 时同理，避免与 NO_PROXY 相互干扰。
@@ -2243,6 +2246,16 @@ fn sabr_replay_once(url: &str, body: &[u8], proxy: Option<&str>) -> Result<Vec<u
 
 /// 单条轨的下一个补拉目标（ms）：第一个缺口的起点；没有缺口就是最后一段的结束时刻。
 fn track_next_target(t: &SabrTrack) -> i64 {
+    // 首段之前的空洞：浏览器从中间起播时，开头那段从未被请求过，轨里最小的
+    // seq 直接从中间开始（实测某片视频轨 seq 97 = 412s、音频轨 seq 42 = 410s）。
+    // 这种空洞不会被下面的「seq 不连续」检测发现 —— 它会一路补到片尾、报告
+    // 「完成」，产物却比全长少一大截（实测 1230s / 1640s，缺的全是开头）。
+    // 所以只要首段不在 0 附近起，就先回头补开头。
+    if let Some((_seq, st)) = t.start.iter().next() {
+        if *st > 1_000 {
+            return 0;
+        }
+    }
     let mut prev_seq: Option<i64> = None;
     for (seq, _st) in &t.start {
         if let Some(p) = prev_seq {
@@ -2344,12 +2357,17 @@ fn sabr_refetch_blocking(
         .map(|s| (s * 1000.0) as i64)
         .max();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    // 600s 对「只补中段缺口」够用，但现在还要回头补开头（实测缺 410s ≈ 还需
+    // 15-25 轮），串行重放每轮 3-10s，600s 会卡在最后一段路上，所以放到 20 分钟。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
     let (mut url, mut base) = cands[0].clone();
     let mut ci = 0usize;
     let mut verified = false;
     let mut stall = 0usize;
     let mut bump_ms: i64 = 0;
+    // 连续失败计数：上游对 googlevideo 是间歇可用的，单次请求失败很常见，
+    // 不能因为「8 个候选各失败一次」就放弃整片（实测三次调用都死在这里）。
+    let mut fails = 0usize;
     let mut reason: Option<String> = None;
 
     for _iters in 0..400usize {
@@ -2371,11 +2389,15 @@ fn sabr_refetch_blocking(
         let resp = match sabr_replay_once(&url, &patched, proxy.as_deref()) {
             Ok(r) => r,
             Err(e) => {
-                ci += 1;
-                if ci >= cands.len() {
-                    reason = Some(format!("回放请求失败: {}", e));
+                // 原实现是 ci += 1、越界就退出：候选各有一次失败机会，用完即弃。
+                // 上游一抖就整片放弃，实测三次调用都因此半途而废。改成轮换候选重试，
+                // 只有「连续失败」达到上限才收手；迭代上限会兜住不退化成长循环。
+                fails += 1;
+                if fails >= 12 {
+                    reason = Some(format!("回放连续失败 {} 次，最后一次: {}", fails, e));
                     break;
                 }
+                ci = (ci + 1) % cands.len();
                 url = cands[ci].0.clone();
                 base = cands[ci].1.clone();
                 verified = false;
@@ -2400,6 +2422,7 @@ fn sabr_refetch_blocking(
             }
         }
         stat.bytes += resp.len();
+        fails = 0; // 这一轮通了，连续失败计数清零
 
         let segs_before: usize = tracks.values().map(|t| t.segs.len()).sum();
         let mut tmp: BTreeMap<u32, SabrTrack> = BTreeMap::new();
@@ -2441,13 +2464,22 @@ fn sabr_refetch_blocking(
         let segs_after: usize = tracks.values().map(|t| t.segs.len()).sum();
         if segs_after == segs_before {
             stall += 1;
-            bump_ms += 15000; // 该位置要不到新东西，往前跳
+            // 该位置要不到新东西，往前跳。步长 30s × 上限 5 次 = 最多跨 150s，
+            // 足以越过「浏览器拖动留下的整段空洞」（实测有 239s 的大洞是分几轮跨过的）。
+            bump_ms += 30000;
             // 换一个候选（不同节点/会话状态可能给得出数据），由 video_id 校验兜底
             ci = (ci + 1) % cands.len();
             url = cands[ci].0.clone();
             base = cands[ci].1.clone();
             verified = false;
-            if stall >= 3 {
+            if stall >= 5 {
+                // 必须设 reason：这里原先只 break，日志会显示成「完成」，
+                // 让人误以为整片补全了，实际是连续多轮拿不到新分段就放弃。
+                reason = Some(format!(
+                    "连续 {} 轮无新增分段（目标位置 {:.1}s 附近要不到数据）",
+                    stall,
+                    target as f64 / 1000.0
+                ));
                 break;
             }
         } else {
@@ -2724,7 +2756,7 @@ fn list_videos(app: &App) -> Response<Body> {
         // init 匹配：优先基名相同（最可靠），其次同目录
         g.init_body = inits
             .iter()
-            .find(|(h, d, b, _)| *h == key.0 && *b == key.2)
+            .find(|(h, _d, b, _)| *h == key.0 && *b == key.2)
             .or_else(|| inits.iter().find(|(h, d, _, _)| *h == key.0 && *d == key.1))
             .map(|(_, _, _, body)| body.clone());
     }
@@ -3668,6 +3700,45 @@ mod sabr_tests {
         t.start.insert(3, 10000);
         t.dur.insert(3, 5000);
         assert_eq!(sabr_next_target(&tracks), 20_000);
+    }
+
+    #[test]
+    fn 首段之前的空洞也要补() {
+        // 浏览器从中间起播：轨里最小的 seq 直接落在 412s，seq 之间并无缺口，
+        // 但开头 412s 从未被请求过。旧逻辑只看 seq 连不连续，会返回 last_end
+        // 而被判成「已到片尾」，于是产物永远缺开头（实测 1230s / 全长 1640s，
+        // 补拉日志却报「完成」）。
+        let mut tracks = BTreeMap::new();
+        let mut v = SabrTrack::default();
+        v.init = Some(FTYP.to_vec());
+        for (seq, st) in [(97i64, 412_000i64), (98, 416_000)] {
+            v.segs.insert(seq, vec![0u8; 8]);
+            v.start.insert(seq, st);
+            v.dur.insert(seq, 4_000);
+        }
+        tracks.insert(399u32, v);
+        assert_eq!(sabr_next_target(&tracks), 0, "首段在 412s，应当回头补开头");
+
+        // 音频轨也从中间起（410s），结论不变
+        let mut a = SabrTrack::default();
+        a.init = Some(b"\x1aE\xdf\xa3init".to_vec());
+        for (seq, st) in [(42i64, 410_000i64), (43, 420_000)] {
+            a.segs.insert(seq, vec![0u8; 8]);
+            a.start.insert(seq, st);
+            a.dur.insert(seq, 10_000);
+        }
+        tracks.insert(251u32, a);
+        assert_eq!(sabr_next_target(&tracks), 0, "两轨都从中间起，同样先补开头");
+
+        // 两轨首段都回到 0 附近（正常从头播）后不再要求从头补，
+        // 恢复成按 seq 缺口推进（此时是 seq 1→97 那个缺口，即 400s）。
+        for itag in [399u32, 251] {
+            let t = tracks.get_mut(&itag).unwrap();
+            t.segs.insert(1, vec![0u8; 8]);
+            t.start.insert(1, 0);
+            t.dur.insert(1, 200_000);
+        }
+        assert_eq!(sabr_next_target(&tracks), 200_000, "首段已在 0 附近，改按缺口推进");
     }
 
     #[test]
