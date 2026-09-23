@@ -119,6 +119,10 @@ pub async fn tcp_dial(
     host: &str,
     port: u16,
 ) -> io::Result<TcpStream> {
+    // 回环目标永远直连：本机服务经外部代理转发没有意义，还会被上游拒绝（表现为 502）
+    if host == "localhost" || host == "::1" || host.starts_with("127.") {
+        return TcpStream::connect((host, port)).await;
+    }
     match upstream {
         None => TcpStream::connect((host, port)).await,
         Some(up) => {

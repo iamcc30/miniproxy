@@ -1054,7 +1054,7 @@ export default function App() {
             <div className="video-modal-head">
               <span className="sub-title" style={{ margin: 0 }}>🎬 视频下载</span>
               <span className="video-hint">
-                来自本次抓包 · YouTube 走 SABR 私有协议（拿不到直链），只能重组浏览器已缓冲的分段
+                来自本次抓包 · YouTube 走 SABR 私有协议（拿不到直链），下载时会自动补拉缺失的分段
               </span>
               <div className="spacer" />
               <button type="button" className="btn" onClick={loadVideos}>↻ 刷新</button>
@@ -1124,7 +1124,7 @@ export default function App() {
                         download
                         title={
                           v.kind === 'sabr'
-                            ? '重组已抓到的 YouTube 分段（SABR/UMP）并用 ffmpeg 合并 · 只包含浏览器缓冲过的部分'
+                            ? '重组 YouTube 分段（SABR/UMP）并用 ffmpeg 合并 · 缺失分段会自动向服务端补拉，缺口大时可能需要 1-3 分钟'
                             : v.audioEntryId
                               ? '分别拉取音视频轨并用 ffmpeg 合并为一个 mp4'
                               : v.kind === 'dash' && !v.rangeGroup

@@ -1112,6 +1112,72 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
         }
     }
 
+    // 2.5) 自动补拉：把浏览器没请求到的分段（中段缺口 + 片尾）用「回放 + 位置改写」
+    // 从服务端要回来。前提是已有 init 段（服务端不会重发 init，没有它拼不出文件）；
+    // 拉不到新数据也不影响后续流程——能补多少算多少。
+    {
+        let has_init = tracks
+            .iter()
+            .any(|(i, t)| itag_is_video(*i) && t.init.is_some() && !t.segs.is_empty());
+        if has_init {
+            let mut cands: Vec<(String, Vec<u8>)> = Vec::new();
+            {
+                let list = app.store.entries.lock().unwrap();
+                for e in list.iter().rev() {
+                    if e.kind != "http" || e.method != "POST" {
+                        continue;
+                    }
+                    // 回放目标必须是 YouTube 媒体节点；本地/其它来源的 UMP 条目
+                    // （例如测试注入）不是有效的补拉目标
+                    if !e.host.contains("googlevideo") {
+                        continue;
+                    }
+                    let ct_ok = {
+                        let inner = e.inner.lock().unwrap();
+                        inner
+                            .content_type
+                            .as_deref()
+                            .map(|c| c.to_lowercase().contains("vnd.yt-ump"))
+                            .unwrap_or(false)
+                    };
+                    if !ct_ok {
+                        continue;
+                    }
+                    // body_of 会锁 e.inner，必须放在上面那个块外面（std Mutex 不可重入）
+                    if let Some(b) = body_of(e, "req") {
+                        cands.push((e.url.clone(), b));
+                        if cands.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if !cands.is_empty() {
+                let proxy = app.upstream().map(|u| format!("http://{}", u.addr()));
+                let vid = video_id.clone();
+                let taken = std::mem::take(&mut tracks);
+                let (tracks2, bytes, reason) =
+                    tokio::task::spawn_blocking(move || {
+                        sabr_refetch_blocking(cands, proxy, vid, taken)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            BTreeMap::new(),
+                            0usize,
+                            Some(format!("补拉任务失败: {}", e)),
+                        )
+                    });
+                tracks = tracks2;
+                eprintln!(
+                    "[umpsave] SABR 补拉: +{} 字节, {}",
+                    bytes,
+                    reason.as_deref().unwrap_or("完成")
+                );
+            }
+        }
+    }
+
     // 3) 选轨：视频按像素面积（并列看字节数），音频按字节数
     let mut vitag: Option<u32> = None;
     let mut vscore: (u64, u64) = (0, 0);
@@ -1694,6 +1760,8 @@ struct UmpHeader {
     itag: u32,
     is_init: bool,
     seq: Option<i64>,
+    /// 段在时间轴上的起点（ms，field 11），补拉时用来定位「从哪继续」。
+    start_ms: i64,
     content_length: Option<i64>,
     duration_ms: i64,
     video_id: Option<String>,
@@ -1716,6 +1784,7 @@ fn ump_parse_header(p: &[u8]) -> Option<UmpHeader> {
                     3 => h.itag = v as u32,
                     8 => h.is_init = v != 0,
                     9 => h.seq = Some(v as i64),
+                    11 => h.start_ms = v as i64,
                     12 => h.duration_ms = v as i64,
                     14 => h.content_length = Some(v as i64),
                     _ => {}
@@ -1767,12 +1836,19 @@ struct SabrTrack {
     /// 不能在合并轨道时取单个响应的累加值当总量：一个响应只带几个分段，
     /// 各响应还会重复覆盖同一 seq，只有按 seq 去重后求和才是真实抓到的时长。
     dur: std::collections::BTreeMap<i64, i64>,
+    /// seq → 该段在时间轴上的起点（ms）。补拉时用它定位「第一个缺口从哪开始」。
+    start: std::collections::BTreeMap<i64, i64>,
 }
 
 impl SabrTrack {
     /// 已抓到的总时长（秒）。断号时是「各段之和」而非首尾跨度，更贴近实际内容量。
     fn captured_secs(&self) -> f64 {
         self.dur.values().sum::<i64>() as f64 / 1000.0
+    }
+    /// 时间轴上最晚一段的结束时刻（ms）。没有时长信息时退回最后一段的起点。
+    fn last_end_ms(&self) -> Option<i64> {
+        let (seq, st) = self.start.iter().rev().next()?;
+        Some(st + self.dur.get(seq).copied().unwrap_or(0))
     }
 }
 
@@ -1844,8 +1920,11 @@ fn ump_absorb(body: &[u8], tracks: &mut std::collections::BTreeMap<u32, SabrTrac
                 t.init = Some(data);
             }
         } else if let Some(seq) = h.seq {
-            if t.segs.insert(seq, data).is_none() && h.duration_ms > 0 {
-                t.dur.insert(seq, h.duration_ms);
+            if t.segs.insert(seq, data).is_none() {
+                if h.duration_ms > 0 {
+                    t.dur.insert(seq, h.duration_ms);
+                }
+                t.start.insert(seq, h.start_ms);
             }
         }
     }
@@ -1866,6 +1945,9 @@ fn sabr_merge_tracks(
         }
         for (seq, ms) in t.dur {
             dst.dur.insert(seq, ms);
+        }
+        for (seq, ms) in t.start {
+            dst.start.insert(seq, ms);
         }
         for (seq, data) in t.segs {
             dst.segs.insert(seq, data);
@@ -1934,6 +2016,343 @@ fn res_area(r: &Option<String>) -> u64 {
         .and_then(|(a, b)| Some(a.parse::<u64>().ok()? * b.parse::<u64>().ok()?))
         .unwrap_or(0)
 }
+
+// ---- SABR 补拉：把浏览器没请求到的分段用「回放 + 位置改写」从服务端要回来 ----
+//
+// 请求体是 protobuf，但里面没有公开文档。下面字段语义全部来自对真实请求体的
+// 差分与受控实验（改一个字段 → 看服务端从哪开始发段），见 2026-09-23 工作日志：
+// - 顶层 field 1 = client_abr_state，其子字段 28/29/36/39 是毫秒级播放位置，
+//   服务端按它决定从时间轴哪个点开始发段；
+// - 顶层 field 3 = 每轨「已缓冲区间声明」（含 seq），服务端会跳过声明过的区域
+//   （只回一个 ~145B 的纯策略 part），必须整段删掉才能拿到任意位置的数据；
+// - 服务端**不会**补发 init 段（只在浏览器从头播放时下发一次），init 只能来自已抓数据。
+
+/// protobuf 标准 LEB128 varint 编码（与 pb_varint 互为逆运算）。
+fn pb_enc_varint(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let c = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(c);
+            break;
+        }
+        out.push(c | 0x80);
+    }
+    out
+}
+
+/// 解析 protobuf 消息 → `(field, wiretype, tag_start, val_start, end)`。
+/// 任何一处解析不下去都返回 None（调用方放弃补丁，宁可不动也别发坏请求）。
+fn pb_split(b: &[u8]) -> Option<Vec<(u64, u8, usize, usize, usize)>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let tag_start = i;
+        let (tag, ni) = pb_varint(b, i)?;
+        i = ni;
+        let wt = (tag & 7) as u8;
+        let val_start = i;
+        match wt {
+            0 => {
+                let (_, ni) = pb_varint(b, i)?;
+                i = ni;
+            }
+            1 => i += 8,
+            5 => i += 4,
+            2 => {
+                let (l, ni) = pb_varint(b, i)?;
+                i = ni.saturating_add(l as usize);
+                if i > b.len() {
+                    return None;
+                }
+                // wt2 的载荷起点在长度字节之后（val_start 语义 = 载荷起点）
+                out.push((tag >> 3, wt, tag_start, ni, i));
+                continue;
+            }
+            _ => return None,
+        }
+        out.push((tag >> 3, wt, tag_start, val_start, i));
+    }
+    Some(out)
+}
+
+/// 把 client_abr_state 里的毫秒位置字段（28/29/36/39）统一改成 target_ms。
+fn sabr_patch_abr_state(body: &[u8], target_ms: i64) -> Option<Vec<u8>> {
+    let fields = pb_split(body)?;
+    let mut out = Vec::with_capacity(body.len() + 16);
+    let mut patched = false;
+    for (field, wt, ts, _, end) in fields {
+        if wt == 0 && matches!(field, 28 | 29 | 36 | 39) {
+            out.extend_from_slice(&pb_enc_varint((field << 3) | 0));
+            out.extend_from_slice(&pb_enc_varint(target_ms as u64));
+            patched = true;
+            continue;
+        }
+        out.extend_from_slice(&body[ts..end]);
+    }
+    if !patched {
+        // 该请求体里没有位置字段（少见）：补一个 39，protobuf 标量字段顺序无关
+        out.extend_from_slice(&pb_enc_varint((39 << 3) | 0));
+        out.extend_from_slice(&pb_enc_varint(target_ms as u64));
+    }
+    Some(out)
+}
+
+/// 把 SABR 请求体改写成「从 target_ms 毫秒处开始要数据」的形态。
+fn sabr_patch_seek(body: &[u8], target_ms: i64) -> Option<Vec<u8>> {
+    let fields = pb_split(body)?;
+    let mut out = Vec::with_capacity(body.len() + 32);
+    for (field, wt, ts, vs, end) in fields {
+        if field == 3 && wt == 2 {
+            continue; // 删掉已缓冲声明，否则服务端跳过声明区域
+        }
+        if field == 1 && wt == 2 {
+            let sub = sabr_patch_abr_state(&body[vs..end], target_ms)?;
+            out.extend_from_slice(&pb_enc_varint((1 << 3) | 2));
+            out.extend_from_slice(&pb_enc_varint(sub.len() as u64));
+            out.extend_from_slice(&sub);
+            continue;
+        }
+        out.extend_from_slice(&body[ts..end]);
+    }
+    Some(out)
+}
+
+/// 提取 part 43（换 host 重试指令）里的新 URL。
+fn ump_redirect_url(body: &[u8]) -> Option<String> {
+    let mut off = 0usize;
+    while off < body.len() {
+        let (ptype, o2) = ump_varint(body, off)?;
+        let (psize, o3) = ump_varint(body, o2)?;
+        let end = o3.saturating_add(psize as usize);
+        if end > body.len() {
+            return None;
+        }
+        if ptype == 43 {
+            let p = &body[o3..end];
+            if let Some(fields) = pb_split(p) {
+                for (f, wt, _, vs, e) in fields {
+                    if f == 1 && wt == 2 {
+                        if let Ok(s) = std::str::from_utf8(&p[vs..e]) {
+                            if s.starts_with("https://") {
+                                return Some(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        off = end;
+    }
+    None
+}
+
+/// 用 curl 把一条 SABR 请求直连上游重放（不经自身抓包：不污染 store、不受 4MB 截断影响）。
+fn sabr_replay_once(url: &str, body: &[u8], proxy: Option<&str>) -> Result<Vec<u8>, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "miniproxy-sabr-replay-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let inp = dir.join("req.bin");
+    let outp = dir.join("resp.bin");
+    let res = (|| -> Result<Vec<u8>, String> {
+        std::fs::write(&inp, body).map_err(|e| e.to_string())?;
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-s", "--max-time", "45", "-X", "POST", "-o"]).arg(&outp);
+        if let Some(p) = proxy {
+            cmd.args(["--proxy", p]);
+        }
+        cmd
+            .args([
+                "-H",
+                "content-type: application/x-protobuf",
+                "-H",
+                "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+                "-H",
+                "origin: https://www.youtube.com",
+                "-H",
+                "referer: https://www.youtube.com/",
+                "-H",
+                "accept-encoding: identity",
+            ])
+            .arg("--data-binary")
+            .arg(format!("@{}", inp.display()))
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let st = cmd.status().map_err(|e| format!("启动 curl 失败: {}", e))?;
+        let out = std::fs::read(&outp).unwrap_or_default();
+        if !st.success() && out.is_empty() {
+            return Err(format!("curl exit {}", st));
+        }
+        Ok(out)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
+/// 视频轨的下一个补拉目标（ms）：主视频轨（段数最多的带 init 视频轨）里
+/// 第一个缺口的起点；没有缺口就取最后一段的结束时刻。
+fn sabr_next_target(tracks: &std::collections::BTreeMap<u32, SabrTrack>) -> i64 {
+    let mut primary: Option<&SabrTrack> = None;
+    for (itag, t) in tracks {
+        if !itag_is_video(*itag) || t.segs.is_empty() || t.init.is_none() {
+            continue;
+        }
+        match primary {
+            Some(p) if p.segs.len() >= t.segs.len() => {}
+            _ => primary = Some(t),
+        }
+    }
+    let Some(t) = primary else { return 0 };
+    let mut prev_seq: Option<i64> = None;
+    for (seq, st) in &t.start {
+        if let Some(p) = prev_seq {
+            if *seq > p + 1 {
+                // 缺口：从前一段的结束时刻继续
+                let end = t.start.get(&p).copied().unwrap_or(0)
+                    + t.dur.get(&p).copied().unwrap_or(0);
+                return end;
+            }
+        }
+        prev_seq = Some(*seq);
+    }
+    t.last_end_ms().unwrap_or(0)
+}
+
+/// 补拉主循环（阻塞，调用方放 spawn_blocking）：按时间轴推进重放，直到补齐/无进展/超时。
+/// 返回 `(轨道表, 拉到的字节数, 结束原因)`。
+fn sabr_refetch_blocking(
+    cands: Vec<(String, Vec<u8>)>,
+    proxy: Option<String>,
+    video_id: String,
+    mut tracks: std::collections::BTreeMap<u32, SabrTrack>,
+) -> (std::collections::BTreeMap<u32, SabrTrack>, usize, Option<String>) {
+    use std::collections::BTreeMap;
+    if cands.is_empty() {
+        return (tracks, 0, Some("没有可回放的 SABR 请求".into()));
+    }
+    // 全片时长：优先 init 段 moov 里的权威值
+    let dur_ms: Option<i64> = tracks
+        .values()
+        .filter_map(|t| t.init.as_deref().and_then(mp4_duration))
+        .map(|s| (s * 1000.0) as i64)
+        .max();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let (mut url, mut base) = cands[0].clone();
+    let mut ci = 0usize;
+    let mut verified = false;
+    let mut stall = 0usize;
+    let mut bump_ms: i64 = 0;
+    let mut fetched = 0usize;
+    let mut reason: Option<String> = None;
+
+    for _iters in 0..400usize {
+        if std::time::Instant::now() > deadline {
+            reason = Some("补拉超时".into());
+            break;
+        }
+        let target = sabr_next_target(&tracks) + bump_ms;
+        if let Some(d) = dur_ms {
+            if target >= d.saturating_sub(1500) {
+                break; // 已到片尾
+            }
+        }
+        let Some(patched) = sabr_patch_seek(&base, target) else {
+            reason = Some("请求体解析失败".into());
+            break;
+        };
+        let resp = match sabr_replay_once(&url, &patched, proxy.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                ci += 1;
+                if ci >= cands.len() {
+                    reason = Some(format!("回放请求失败: {}", e));
+                    break;
+                }
+                url = cands[ci].0.clone();
+                base = cands[ci].1.clone();
+                verified = false;
+                continue;
+            }
+        };
+        let mut resp = resp;
+        if let Some(new_url) = ump_redirect_url(&resp) {
+            // 服务端让换 host 重试：拿同一个 body POST 到新地址
+            url = new_url;
+            match sabr_replay_once(&url, &patched, proxy.as_deref()) {
+                Ok(r) => resp = r,
+                Err(_) => {
+                    stall += 1;
+                    if stall >= 3 {
+                        reason = Some("重定向后仍失败".into());
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        fetched += resp.len();
+
+        let segs_before: usize = tracks.values().map(|t| t.segs.len()).sum();
+        let mut tmp: BTreeMap<u32, SabrTrack> = BTreeMap::new();
+        let vid = ump_absorb(&resp, &mut tmp);
+        if !verified {
+            match vid {
+                Some(v) if v == video_id => verified = true,
+                Some(_) => {
+                    // 候选请求不属于本视频，换下一个
+                    ci += 1;
+                    if ci >= cands.len() {
+                        reason = Some("回放得到的是别的视频".into());
+                        break;
+                    }
+                    url = cands[ci].0.clone();
+                    base = cands[ci].1.clone();
+                    verified = false;
+                    continue;
+                }
+                None => {
+                    // 纯策略响应（没有媒体）：会话可能已结束或被节流
+                    stall += 1;
+                    if stall >= 4 {
+                        reason = Some("服务端不再返回媒体（播放会话可能已结束）".into());
+                        break;
+                    }
+                    bump_ms += 15000;
+                    continue;
+                }
+            }
+        }
+        sabr_merge_tracks(&mut tracks, tmp);
+        let segs_after: usize = tracks.values().map(|t| t.segs.len()).sum();
+        if segs_after == segs_before {
+            stall += 1;
+            bump_ms += 15000; // 该位置要不到新东西，往前跳
+            // 换一个候选（不同节点/会话状态可能给得出数据），由 video_id 校验兜底
+            ci = (ci + 1) % cands.len();
+            url = cands[ci].0.clone();
+            base = cands[ci].1.clone();
+            verified = false;
+            if stall >= 3 {
+                break;
+            }
+        } else {
+            stall = 0;
+            bump_ms = 0;
+        }
+    }
+    (tracks, fetched, reason)
+}
+
 
 /// 视频下载器：把抓包条目聚合为「可完整获取」的视频列表。
 /// 四类来源（下载入口各不相同）：
@@ -3068,5 +3487,78 @@ mod sabr_tests {
         assert_eq!(v.segs.len(), 1);
         assert_eq!(v.captured_secs(), 7.0);
         assert_eq!(v.segs.keys().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn 补丁与编解码() {
+        // LEB128 编码/解码往返
+        for v in [0u64, 1, 127, 128, 300, 16383, 16384, 1 << 20, u32::MAX as u64] {
+            let e = pb_enc_varint(v);
+            let (got, n) = pb_varint(&e, 0).expect("decode");
+            assert_eq!(got, v);
+            assert_eq!(n, e.len());
+        }
+        // pb_split 解析 + 补丁保真：改位置字段后其它字段原样保留、缓冲声明被删
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&pb_enc_varint((1 << 3) | 2)); // field1, len-delim
+        {
+            let mut sub = Vec::new();
+            sub.extend_from_slice(&pb_enc_varint((19 << 3) | 0));
+            sub.extend_from_slice(&pb_enc_varint(1180));
+            sub.extend_from_slice(&pb_enc_varint((29 << 3) | 0));
+            sub.extend_from_slice(&pb_enc_varint(332416));
+            msg.extend_from_slice(&pb_enc_varint(sub.len() as u64));
+            msg.extend_from_slice(&sub);
+        }
+        msg.extend_from_slice(&pb_enc_varint((3 << 3) | 2)); // field3 缓冲声明
+        msg.extend_from_slice(&pb_enc_varint(3));
+        msg.extend_from_slice(b"abc");
+        msg.extend_from_slice(&pb_enc_varint((5 << 3) | 0)); // field5 varint
+        msg.extend_from_slice(&pb_enc_varint(42));
+
+        let patched = sabr_patch_seek(&msg, 600_000).expect("patch");
+        let fields = pb_split(&patched).expect("split");
+        let kinds: Vec<u64> = fields.iter().map(|f| f.0).collect();
+        assert_eq!(kinds, vec![1, 5], "field3（缓冲声明）应被删除");
+        // field1 内部：19 原样，29 变成 600000
+        let (_, _, _, vs, e) = fields[0];
+        let sub_msg = &patched[vs..e];
+        let sub = pb_split(sub_msg).expect("sub");
+        let mut got19 = None;
+        let mut got29 = None;
+        for (f, wt, _, vst, e2) in sub {
+            if f == 19 && wt == 0 {
+                got19 = pb_varint(&sub_msg[vst..e2], 0).map(|x| x.0);
+            }
+            if f == 29 && wt == 0 {
+                got29 = pb_varint(&sub_msg[vst..e2], 0).map(|x| x.0);
+            }
+        }
+        assert_eq!(got19, Some(1180));
+        assert_eq!(got29, Some(600_000));
+        // field5 原样保留
+        let (_, _, _, vst, e2) = fields[1];
+        assert_eq!(pb_varint(&patched[vst..e2], 0).unwrap().0, 42);
+    }
+
+    #[test]
+    fn 下一个补拉目标() {
+        let mut tracks = BTreeMap::new();
+        let mut t = SabrTrack::default();
+        t.init = Some(b"ftypxxxx".to_vec());
+        for (seq, st, d) in [(1i64, 0i64, 5000i64), (2, 5000, 5000), (4, 15000, 5000)] {
+            t.segs.insert(seq, vec![0u8; 8]);
+            t.start.insert(seq, st);
+            t.dur.insert(seq, d);
+        }
+        tracks.insert(399u32, t);
+        // seq 3 缺失：应从 seq2 的结束时刻（10000ms）继续
+        assert_eq!(sabr_next_target(&tracks), 10_000);
+        // 补上 3 之后：目标是最后一段结束（20000）
+        let t = tracks.get_mut(&399).unwrap();
+        t.segs.insert(3, vec![0u8; 8]);
+        t.start.insert(3, 10000);
+        t.dur.insert(3, 5000);
+        assert_eq!(sabr_next_target(&tracks), 20_000);
     }
 }
