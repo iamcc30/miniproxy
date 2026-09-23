@@ -2219,33 +2219,55 @@ fn sabr_replay_once(url: &str, body: &[u8], proxy: Option<&str>) -> Result<Vec<u
     res
 }
 
-/// 视频轨的下一个补拉目标（ms）：主视频轨（段数最多的带 init 视频轨）里
-/// 第一个缺口的起点；没有缺口就取最后一段的结束时刻。
-fn sabr_next_target(tracks: &std::collections::BTreeMap<u32, SabrTrack>) -> i64 {
-    let mut primary: Option<&SabrTrack> = None;
-    for (itag, t) in tracks {
-        if !itag_is_video(*itag) || t.segs.is_empty() || t.init.is_none() {
-            continue;
-        }
-        match primary {
-            Some(p) if p.segs.len() >= t.segs.len() => {}
-            _ => primary = Some(t),
-        }
-    }
-    let Some(t) = primary else { return 0 };
+/// 单条轨的下一个补拉目标（ms）：第一个缺口的起点；没有缺口就是最后一段的结束时刻。
+fn track_next_target(t: &SabrTrack) -> i64 {
     let mut prev_seq: Option<i64> = None;
-    for (seq, st) in &t.start {
+    for (seq, _st) in &t.start {
         if let Some(p) = prev_seq {
             if *seq > p + 1 {
                 // 缺口：从前一段的结束时刻继续
-                let end = t.start.get(&p).copied().unwrap_or(0)
+                return t.start.get(&p).copied().unwrap_or(0)
                     + t.dur.get(&p).copied().unwrap_or(0);
-                return end;
             }
         }
         prev_seq = Some(*seq);
     }
     t.last_end_ms().unwrap_or(0)
+}
+
+/// 按类型挑「段数最多」的带 init 轨：避免同一类型里的备选低码率轨
+/// （可能只有 init + 一两个段，且其 FormatId 未必在选中列表里）把目标带偏。
+fn pick_track(tracks: &std::collections::BTreeMap<u32, SabrTrack>, video: bool) -> Option<&SabrTrack> {
+    tracks
+        .iter()
+        .filter(|(i, t)| {
+            let kind_ok = if video {
+                itag_is_video(**i)
+            } else {
+                itag_is_audio(**i)
+            };
+            kind_ok && t.init.is_some() && !t.segs.is_empty()
+        })
+        .map(|(_, t)| t)
+        .max_by_key(|t| t.segs.len())
+}
+
+/// 下一个补拉目标（ms）：所有可成片轨里**最早**的那个缺口起点。
+///
+/// 只盯主视频轨是不够的：浏览器拖动播放时音视频被跳过的区间并不相同，
+/// 视频轨在某个位置之后可能已经连续（没有缺口），而音频轨在那里还缺一大段。
+/// 若只按视频轨推进，那些音频独有的缺口永远补不上，合并后表现为音画不同步。
+///
+/// 没有带 init 的视频轨时返回 0——此时拼不出可播文件，补拉没有意义。
+fn sabr_next_target(tracks: &std::collections::BTreeMap<u32, SabrTrack>) -> i64 {
+    let Some(v) = pick_track(tracks, true) else {
+        return 0;
+    };
+    let mut target = track_next_target(v);
+    if let Some(a) = pick_track(tracks, false) {
+        target = target.min(track_next_target(a));
+    }
+    target
 }
 
 /// 补拉主循环（阻塞，调用方放 spawn_blocking）：按时间轴推进重放，直到补齐/无进展/超时。
@@ -3581,6 +3603,48 @@ mod sabr_tests {
         t.start.insert(3, 10000);
         t.dur.insert(3, 5000);
         assert_eq!(sabr_next_target(&tracks), 20_000);
+    }
+
+    #[test]
+    fn 补拉兼顾音频缺口() {
+        let mut tracks = BTreeMap::new();
+
+        // 视频轨：seq 1..5 连续无缺口 → 目标为尾段结束 30000
+        let mut v = SabrTrack::default();
+        v.init = Some(FTYP.to_vec());
+        for i in 0..5i64 {
+            v.segs.insert(i + 1, vec![0u8; 8]);
+            v.start.insert(i + 1, i * 6000);
+            v.dur.insert(i + 1, 6000);
+        }
+        tracks.insert(398u32, v);
+
+        // 音频轨：seq2 之后直接跳到 seq5 → 缺口起点 = seq2 结束 = 20000
+        let mut a = SabrTrack::default();
+        a.init = Some(EBML.to_vec());
+        for (seq, st) in [(1i64, 0i64), (2, 10_000), (5, 40_000)] {
+            a.segs.insert(seq, vec![0u8; 8]);
+            a.start.insert(seq, st);
+            a.dur.insert(seq, 10_000);
+        }
+        tracks.insert(251u32, a);
+
+        // 音频缺口（20000）早于视频尾段结束（30000）→ 必须先补音频，
+        // 否则视频轨「看不出问题」就一路推到片尾，这段音频缺口永久残留。
+        assert_eq!(sabr_next_target(&tracks), 20_000);
+
+        // 音频缺口补齐后两条轨都连续，取更早的视频尾段结束 30000
+        let a = tracks.get_mut(&251).unwrap();
+        for seq in [3i64, 4] {
+            a.segs.insert(seq, vec![0u8; 8]);
+            a.start.insert(seq, (seq - 1) * 10_000);
+            a.dur.insert(seq, 10_000);
+        }
+        assert_eq!(sabr_next_target(&tracks), 30_000);
+
+        // 没有带 init 的视频轨 → 拼不出可播文件，补拉无从下手
+        tracks.remove(&398);
+        assert_eq!(sabr_next_target(&tracks), 0);
     }
 
     // ---- 补拉链路的离线端到端验证 ----
