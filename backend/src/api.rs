@@ -1115,6 +1115,7 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
     // 2.5) 自动补拉：把浏览器没请求到的分段（中段缺口 + 片尾）用「回放 + 位置改写」
     // 从服务端要回来。前提是已有 init 段（服务端不会重发 init，没有它拼不出文件）；
     // 拉不到新数据也不影响后续流程——能补多少算多少。
+    let mut refetch: Option<RefetchStat> = None;
     {
         let has_init = tracks
             .iter()
@@ -1156,24 +1157,29 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
                 let proxy = app.upstream().map(|u| format!("http://{}", u.addr()));
                 let vid = video_id.clone();
                 let taken = std::mem::take(&mut tracks);
-                let (tracks2, bytes, reason) =
+                let (tracks2, st) =
                     tokio::task::spawn_blocking(move || {
                         sabr_refetch_blocking(cands, proxy, vid, taken)
                     })
                     .await
                     .unwrap_or_else(|e| {
-                        (
-                            BTreeMap::new(),
-                            0usize,
-                            Some(format!("补拉任务失败: {}", e)),
-                        )
+                        let mut s = RefetchStat::default();
+                        s.reason = Some(format!("补拉任务失败: {}", e));
+                        (BTreeMap::new(), s)
                     });
                 tracks = tracks2;
                 eprintln!(
-                    "[umpsave] SABR 补拉: +{} 字节, {}",
-                    bytes,
-                    reason.as_deref().unwrap_or("完成")
+                    "[umpsave] SABR 补拉: +{} 段 / {} 字节, {} 次请求命中 {} 次, \
+                     耗时 {}ms (均 {:.0}ms/请求), {}",
+                    st.added,
+                    st.bytes,
+                    st.reqs,
+                    st.hits,
+                    st.elapsed_ms,
+                    st.per_req_ms(),
+                    st.reason.as_deref().unwrap_or("完成")
                 );
+                refetch = Some(st);
             }
         }
     }
@@ -1337,16 +1343,32 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
         let _ = std::fs::remove_dir_all(&dir2);
     });
 
-    Response::builder()
+    let mut rb = Response::builder()
         .header(header::CONTENT_TYPE, ctype)
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", name),
-        )
-        .body(Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
-        .unwrap()
+        );
+    // 补拉统计挂到响应头：`curl -D -` 就能看到「补了多少、要等多久」，
+    // 不用翻后端日志。（reason 是中文，HTTP 头只允许可见 ASCII，所以它只进日志。）
+    if let Some(st) = &refetch {
+        rb = rb.header(
+            "x-sabr-refetch",
+            format!(
+                "segments={},bytes={},requests={},hits={},elapsed_ms={},per_req_ms={:.0}",
+                st.added,
+                st.bytes,
+                st.reqs,
+                st.hits,
+                st.elapsed_ms,
+                st.per_req_ms()
+            ),
+        );
+    }
+    rb.body(Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
+        rx,
+    )))
+    .unwrap()
 }
 
 fn json_response(v: serde_json::Value) -> Response<Body> {
@@ -2270,17 +2292,50 @@ fn sabr_next_target(tracks: &std::collections::BTreeMap<u32, SabrTrack>) -> i64 
     target
 }
 
+/// 一次补拉的统计。补拉是串行重放，耗时 ≈ 请求次数 × 单次往返，
+/// 所以把请求数、命中数、耗时都记下来，「要等多久」才有据可依。
+#[derive(Default, Debug)]
+struct RefetchStat {
+    /// 实际发出的回放请求数（含跟随 part43 的第二次、失败重试）
+    reqs: usize,
+    /// 其中拿到媒体的次数
+    hits: usize,
+    /// 响应字节数合计
+    bytes: usize,
+    /// 新增的分段数
+    added: usize,
+    elapsed_ms: u128,
+    reason: Option<String>,
+}
+
+impl RefetchStat {
+    fn per_req_ms(&self) -> f64 {
+        if self.reqs == 0 {
+            0.0
+        } else {
+            self.elapsed_ms as f64 / self.reqs as f64
+        }
+    }
+}
+
 /// 补拉主循环（阻塞，调用方放 spawn_blocking）：按时间轴推进重放，直到补齐/无进展/超时。
-/// 返回 `(轨道表, 拉到的字节数, 结束原因)`。
+/// 返回 `(轨道表, 统计)`。
 fn sabr_refetch_blocking(
     cands: Vec<(String, Vec<u8>)>,
     proxy: Option<String>,
     video_id: String,
     mut tracks: std::collections::BTreeMap<u32, SabrTrack>,
-) -> (std::collections::BTreeMap<u32, SabrTrack>, usize, Option<String>) {
+) -> (std::collections::BTreeMap<u32, SabrTrack>, RefetchStat) {
     use std::collections::BTreeMap;
+    let t0 = std::time::Instant::now();
+    let segs_total =
+        |t: &BTreeMap<u32, SabrTrack>| t.values().map(|x| x.segs.len()).sum::<usize>();
+    let start_segs = segs_total(&tracks);
+    let mut stat = RefetchStat::default();
     if cands.is_empty() {
-        return (tracks, 0, Some("没有可回放的 SABR 请求".into()));
+        stat.reason = Some("没有可回放的 SABR 请求".into());
+        stat.elapsed_ms = t0.elapsed().as_millis();
+        return (tracks, stat);
     }
     // 全片时长：优先 init 段 moov 里的权威值
     let dur_ms: Option<i64> = tracks
@@ -2295,7 +2350,6 @@ fn sabr_refetch_blocking(
     let mut verified = false;
     let mut stall = 0usize;
     let mut bump_ms: i64 = 0;
-    let mut fetched = 0usize;
     let mut reason: Option<String> = None;
 
     for _iters in 0..400usize {
@@ -2313,6 +2367,7 @@ fn sabr_refetch_blocking(
             reason = Some("请求体解析失败".into());
             break;
         };
+        stat.reqs += 1;
         let resp = match sabr_replay_once(&url, &patched, proxy.as_deref()) {
             Ok(r) => r,
             Err(e) => {
@@ -2331,6 +2386,7 @@ fn sabr_refetch_blocking(
         if let Some(new_url) = ump_redirect_url(&resp) {
             // 服务端让换 host 重试：拿同一个 body POST 到新地址
             url = new_url;
+            stat.reqs += 1;
             match sabr_replay_once(&url, &patched, proxy.as_deref()) {
                 Ok(r) => resp = r,
                 Err(_) => {
@@ -2343,7 +2399,7 @@ fn sabr_refetch_blocking(
                 }
             }
         }
-        fetched += resp.len();
+        stat.bytes += resp.len();
 
         let segs_before: usize = tracks.values().map(|t| t.segs.len()).sum();
         let mut tmp: BTreeMap<u32, SabrTrack> = BTreeMap::new();
@@ -2375,7 +2431,13 @@ fn sabr_refetch_blocking(
                 }
             }
         }
+        // 只有本轮真的带回了分段才算命中：verified 之后空响应（纯策略 part）
+        // 也会走到这里，不排除掉命中数会虚高。
+        let got_media = tmp.values().any(|t| !t.segs.is_empty());
         sabr_merge_tracks(&mut tracks, tmp);
+        if got_media {
+            stat.hits += 1;
+        }
         let segs_after: usize = tracks.values().map(|t| t.segs.len()).sum();
         if segs_after == segs_before {
             stall += 1;
@@ -2393,7 +2455,10 @@ fn sabr_refetch_blocking(
             bump_ms = 0;
         }
     }
-    (tracks, fetched, reason)
+    stat.added = segs_total(&tracks).saturating_sub(start_segs);
+    stat.elapsed_ms = t0.elapsed().as_millis();
+    stat.reason = reason;
+    (tracks, stat)
 }
 
 
@@ -3826,7 +3891,7 @@ mod sabr_tests {
         f3.extend(pb_var(3, 0));
         body.extend(pb_len(3, &f3));
 
-        let (out, bytes, reason) = sabr_refetch_blocking(
+        let (out, st) = sabr_refetch_blocking(
             vec![(url, body)],
             None,
             "tYvu6IpSfiM".to_string(),
@@ -3839,21 +3904,35 @@ mod sabr_tests {
             seqs,
             (1..=8).collect::<Vec<i64>>(),
             "缺口与片尾都该被补上；结束原因 {:?}",
-            reason
+            st.reason
         );
-        assert!(bytes > 0, "应当真的拉到了字节");
-        assert!(
-            served.load(Ordering::SeqCst) >= 3,
-            "至少 3 轮应当拿到媒体，实际 {}（hits={}）",
-            served.load(Ordering::SeqCst),
-            hits.load(Ordering::SeqCst)
-        );
-        eprintln!(
-            "补拉结束: +{} 字节, {} 次请求, {} 次命中, 原因 {:?}",
-            bytes,
+        assert!(st.bytes > 0, "应当真的拉到了字节");
+        assert_eq!(st.added, 6, "起点已有 2 段，应新增 6 段");
+        assert!(st.hits >= 3, "至少 3 轮应当拿到媒体，实际 {}", st.hits);
+        // 统计值要和服务端侧的计数对得上，否则「耗时/请求数」这类指标会失真
+        assert_eq!(
+            st.reqs,
             hits.load(Ordering::SeqCst),
+            "统计的请求数应与服务端收到的一致"
+        );
+        assert_eq!(
+            st.hits,
             served.load(Ordering::SeqCst),
-            reason
+            "统计的命中数应与服务端实际发媒体的次数一致"
+        );
+        assert!(st.per_req_ms().is_finite() && st.per_req_ms() >= 0.0);
+        // 这个假服务端在本机内存里、没有真实网络延迟，所以打印出来的耗时是
+        // 「每轮固定开销」的下限（curl 进程启动 + 临时文件 + 本地 HTTP 往返 + 解析）。
+        // 真实补拉耗时 ≈ 请求数 × (这个下限 + 一次跨网上游往返 + 下载 1-2MB)。
+        eprintln!(
+            "补拉结束: +{} 段 / {} 字节, {} 次请求命中 {} 次, 耗时 {}ms (均 {:.0}ms/请求), 原因 {:?}",
+            st.added,
+            st.bytes,
+            st.reqs,
+            st.hits,
+            st.elapsed_ms,
+            st.per_req_ms(),
+            st.reason
         );
     }
 

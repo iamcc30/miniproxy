@@ -39,13 +39,24 @@ fi
 
 echo "== 3/4 下载（会自动补拉缺口，缺口大时可能 1-3 分钟）=="
 start=$(date +%s)
-code=$(curl --noproxy '*' -s --max-time 1800 -w '%{http_code}' \
+code=$(curl --noproxy '*' -s --max-time 1800 -D "$OUT/headers.txt" -w '%{http_code}' \
             -o "$OUT/out.bin" "$API/api/entries/$ID/umpsave")
-echo "   HTTP $code, $(ls -lh "$OUT/out.bin" 2>/dev/null | awk '{print $5}'), 用时 $(( $(date +%s) - start ))s"
+wall=$(( $(date +%s) - start ))
+echo "   HTTP $code, $(ls -lh "$OUT/out.bin" 2>/dev/null | awk '{print $5}'), 墙钟耗时 ${wall}s"
 if [ "$code" != "200" ]; then
   echo "   下载失败，前端会显示具体原因；后端日志里有 [umpsave] SABR 补拉 的统计。"
   head -c 300 "$OUT/out.bin"; echo; exit 1
 fi
+
+# 补拉统计：耗时里多少花在补拉、多少花在 ffmpeg 合并，一目了然
+STAT=$(grep -i '^x-sabr-refetch:' "$OUT/headers.txt" | tr -d '\r' | cut -d' ' -f2-)
+echo "   补拉统计: ${STAT:-（无，说明本次没触发补拉）}"
+echo "$STAT" | tr ',' '\n' | sed 's/^/     /'
+patch_ms=$(echo "$STAT" | tr ',' '\n' | grep '^elapsed_ms=' | cut -d= -f2)
+if [ -n "${patch_ms:-}" ]; then
+  echo "   → 补拉占 ${patch_ms}ms，其余 $(( wall * 1000 - patch_ms ))ms 是写出 + ffmpeg 合并"
+fi
+
 
 echo "== 4/4 校验 =="
 # 容器按魔数判断（grep 直接匹配二进制魔数不可靠，用 xxd/dd）
