@@ -2165,8 +2165,29 @@ fn sabr_replay_once(url: &str, body: &[u8], proxy: Option<&str>) -> Result<Vec<u
         std::fs::write(&inp, body).map_err(|e| e.to_string())?;
         let mut cmd = std::process::Command::new("curl");
         cmd.args(["-s", "--max-time", "45", "-X", "POST", "-o"]).arg(&outp);
-        if let Some(p) = proxy {
-            cmd.args(["--proxy", p]);
+        // 隔离外部代理环境变量：curl 会读 http_proxy/https_proxy/all_proxy，
+        // 若本进程是从带这些变量的 shell 里起来的，补拉会被悄悄改道（甚至劫持到
+        // 别的代理上）；显式 --proxy 时同理，避免与 NO_PROXY 相互干扰。
+        for k in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ] {
+            cmd.env_remove(k);
+        }
+        match proxy {
+            Some(p) => {
+                cmd.args(["--proxy", p, "--noproxy", ""]);
+            }
+            // 直连：显式关掉 curl 自身的代理发现（默认还会读 ~/.curlrc 里可能存在的 proxy）
+            None => {
+                cmd.args(["--noproxy", "*"]);
+            }
         }
         cmd
             .args([
@@ -3560,5 +3581,236 @@ mod sabr_tests {
         t.start.insert(3, 10000);
         t.dur.insert(3, 5000);
         assert_eq!(sabr_next_target(&tracks), 20_000);
+    }
+
+    // ---- 补拉链路的离线端到端验证 ----
+    //
+    // Google 出口不通时没法真机复验，这里用本地假 SABR 服务端复刻服务端的关键行为，
+    // 把 sabr_refetch_blocking 的整条循环跑完：
+    //   · 请求体里只要还留着 f3（已缓冲声明）→ 一律回空响应（模拟服务端「跳过已声明区域」）
+    //   · 删掉 f3 后 → 按 f1 里的位置返回该位置之后的分段
+    // 断言：浏览器只缓冲了开头两段时，能把整条视频轨补全。
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// 复刻「服务端如何读请求」：带 f3 的一律拒发（返回 None）；
+    /// 否则从 f1 的 28/29/36/39 里取出客户端声明的位置。
+    fn sabr_body_pos(body: &[u8]) -> Option<i64> {
+        let fields = pb_split(body)?;
+        if fields.iter().any(|(f, _, _, _, _)| *f == 3) {
+            return None; // 还带着缓冲声明 → 服务端会跳过，不给媒体
+        }
+        for (f, wt, _ts, vs, e) in fields {
+            if f != 1 || wt != 2 {
+                continue;
+            }
+            let sub = &body[vs..e];
+            for (sf, swt, _a, svs, _b) in pb_split(sub)? {
+                if matches!(sf, 28 | 29 | 36 | 39) && swt == 0 {
+                    return pb_varint(sub, svs).map(|(v, _)| v as i64);
+                }
+            }
+        }
+        None
+    }
+
+    /// 测试用 MediaHeader（start_ms 可控，helper `header` 把 start 硬编码成 seq*7000）。
+    fn hdr(id: u64, itag: u64, seq: Option<u64>, start_ms: i64, dur_ms: u64) -> Vec<u8> {
+        let mut h = pb_var(1, id);
+        h.extend(pb_len(2, b"tYvu6IpSfiM"));
+        h.extend(pb_var(3, itag));
+        if let Some(s) = seq {
+            h.extend(pb_var(9, s));
+            h.extend(pb_var(11, start_ms as u64));
+        }
+        h.extend(pb_var(12, dur_ms));
+        h
+    }
+
+    /// 本地假 SABR 服务端。返回 (回放 URL, 总请求数, 成功返回媒体的次数)。
+    fn spawn_fake_sabr(
+        segs: Vec<(u64, i64, i64)>,
+        itag: u64,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::new(AtomicUsize::new(0));
+        let (h2, s2) = (hits.clone(), served.clone());
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                h2.fetch_add(1, Ordering::SeqCst);
+
+                // 读满一个请求（按 content-length 判断正文结束）
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let mut body_at: Option<usize> = None;
+                let mut want = 0usize;
+                loop {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if body_at.is_none() {
+                        if let Some(p) = find_sub(&buf, b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                            let cl = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")?
+                                        .trim()
+                                        .parse::<usize>()
+                                        .ok()
+                                })
+                                .unwrap_or(0);
+                            body_at = Some(p + 4);
+                            want = p + 4 + cl;
+                        }
+                    }
+                    if body_at.is_some() && buf.len() >= want {
+                        break;
+                    }
+                    if buf.len() > 16_000_000 {
+                        break;
+                    }
+                }
+
+                let at = body_at.unwrap_or(buf.len());
+                let body: &[u8] = buf.get(at..).unwrap_or(&[]);
+
+                let mut out: Vec<u8> = Vec::new();
+                if let Some(pos) = sabr_body_pos(body) {
+                    let picked: Vec<(u64, i64, i64)> = segs
+                        .iter()
+                        .filter(|(_, st, _)| *st >= pos)
+                        .take(2)
+                        .copied()
+                        .collect();
+                    if !picked.is_empty() {
+                        for (i, (seq, st, dur)) in picked.iter().enumerate() {
+                            let id = (i + 1) as u64;
+                            out.extend(part(20, &hdr(id, itag, Some(*seq), *st, *dur as u64)));
+                        }
+                        for i in 0..picked.len() {
+                            out.extend(part(21, &media((i + 1) as u8, &MOOF)));
+                        }
+                        s2.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.yt-ump\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    out.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&out);
+                let _ = s.flush();
+            }
+        });
+
+        (
+            format!("http://127.0.0.1:{}/videoplayback?sabr=1&ump=1", port),
+            hits,
+            served,
+        )
+    }
+
+    #[test]
+    fn 补拉能补齐整轨() {
+        use std::sync::atomic::Ordering;
+        const ITAG: u64 = 399;
+        const DUR: i64 = 5000;
+        // 服务端手上共有 8 段（seq 1..8，每段 5s）
+        let all: Vec<(u64, i64, i64)> =
+            (1..=8u64).map(|s| (s, (s as i64 - 1) * DUR, DUR)).collect();
+        let (url, hits, served) = spawn_fake_sabr(all.clone(), ITAG);
+
+        // 起点：浏览器只缓冲了 init + 前 2 段 → seq3 起是缺口
+        let mut tracks: BTreeMap<u32, SabrTrack> = BTreeMap::new();
+        let mut t = SabrTrack::default();
+        t.init = Some(FTYP.to_vec());
+        for (seq, st, d) in all.iter().take(2) {
+            t.segs.insert(*seq as i64, vec![0u8; 16]);
+            t.start.insert(*seq as i64, *st);
+            t.dur.insert(*seq as i64, *d);
+        }
+        tracks.insert(ITAG as u32, t);
+
+        // 浏览器那次的请求体：有 f1（位置）也有 f3（已缓冲声明）。
+        // f3 必须被删掉——留着的话假服务端（和真服务端一样）什么都不会给。
+        let mut f1 = pb_var(1, 0);
+        f1.extend(pb_var(29, 0)); // 位置字段
+        f1.extend(pb_len(38, b"x")); // 分辨率表，应被原样保留
+        let mut body = pb_len(1, &f1);
+        let mut f3 = pb_var(1, ITAG);
+        f3.extend(pb_var(3, 0));
+        body.extend(pb_len(3, &f3));
+
+        let (out, bytes, reason) = sabr_refetch_blocking(
+            vec![(url, body)],
+            None,
+            "tYvu6IpSfiM".to_string(),
+            tracks,
+        );
+
+        let track = out.get(&(ITAG as u32)).expect("视频轨应当还在");
+        let seqs: Vec<i64> = track.segs.keys().copied().collect();
+        assert_eq!(
+            seqs,
+            (1..=8).collect::<Vec<i64>>(),
+            "缺口与片尾都该被补上；结束原因 {:?}",
+            reason
+        );
+        assert!(bytes > 0, "应当真的拉到了字节");
+        assert!(
+            served.load(Ordering::SeqCst) >= 3,
+            "至少 3 轮应当拿到媒体，实际 {}（hits={}）",
+            served.load(Ordering::SeqCst),
+            hits.load(Ordering::SeqCst)
+        );
+        eprintln!(
+            "补拉结束: +{} 字节, {} 次请求, {} 次命中, 原因 {:?}",
+            bytes,
+            hits.load(Ordering::SeqCst),
+            served.load(Ordering::SeqCst),
+            reason
+        );
+    }
+
+    #[test]
+    fn 请求体带缓冲声明时服务端不给媒体() {
+        // 反向对照：确认上面的假服务端确实复刻了「f3 在 → 拒发」这一关键行为，
+        // 否则「补拉能补齐整轨」这个测试就无法证明 sabr_patch_seek 真的删掉了 f3。
+        let mut f1 = pb_var(1, 0);
+        f1.extend(pb_var(29, 300_000));
+        let mut body = pb_len(1, &f1);
+        let mut f3 = pb_var(1, 399);
+        f3.extend(pb_var(3, 0));
+        body.extend(pb_len(3, &f3));
+        assert_eq!(sabr_body_pos(&body), None, "带 f3 应当被拒");
+
+        // 删掉 f3（正是 sabr_patch_seek 做的事）之后就能读出位置
+        let patched = sabr_patch_seek(&body, 600_000).expect("补丁应当成功");
+        assert_eq!(
+            sabr_body_pos(&patched),
+            Some(600_000),
+            "位置应被改写成目标毫秒"
+        );
     }
 }
