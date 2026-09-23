@@ -929,8 +929,10 @@ async fn entry_fullmux(req: Request<Body>, app: Arc<App>, path: &str) -> Respons
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("创建临时目录失败: {}", e));
     }
-    let vfile = dir.join("video.m4s");
-    let afile = dir.join("audio.m4s");
+    // 扩展名要贴合真实容器：ffmpeg 对 .m4s 的格式探测不稳（fMP4 会被当成未知），
+    // 用 .mp4 让它走 mp4 解复用器；HLS 拼出来的分片则是 .ts。
+    let vfile = dir.join(if entry_is_hls(&video_entry) { "video.ts" } else { "video.mp4" });
+    let afile = dir.join(if entry_is_hls(&audio_entry) { "audio.ts" } else { "audio.mp4" });
     let ofile = dir.join("out.mp4");
 
     let cleanup = |dir: &std::path::Path| {
@@ -1179,19 +1181,42 @@ fn mp4_resolution(b: &[u8]) -> Option<(u32, u32)> {
         }
         out
     }
+    /// 只有这些容器盒才值得下钻（tkhd 就挂在 moov → trak 下）。
+    /// 必须白名单：正文被截断时，mdat 里的随机字节会被误读成 box 头，
+    /// 若见 box 就递归，遇到伪造的 largesize(size==1) 时每层只前进 16 字节，
+    /// 递归深度可达数万层，直接打爆 tokio worker 的栈（进程 abort）。
+    fn is_container(t: &[u8]) -> bool {
+        [
+            &b"moov"[..],
+            &b"trak"[..],
+            &b"edts"[..],
+            &b"mdia"[..],
+            &b"minf"[..],
+            &b"stbl"[..],
+            &b"mvex"[..],
+            &b"moof"[..],
+            &b"traf"[..],
+        ]
+        .contains(&t)
+    }
     // tkhd 嵌在 moov → trak → tkhd（也可能更深），递归整棵 box 树查找；
-    // 多轨道时取像素面积最大的那个
-    fn find_tkhds(b: &[u8], out: &mut Vec<Vec<u8>>) {
+    // 多轨道时取像素面积最大的那个。深度上限是白名单之外的第二道保险。
+    fn find_tkhds(b: &[u8], depth: u8, out: &mut Vec<Vec<u8>>) {
+        if depth > 8 {
+            return;
+        }
         for (t, payload) in boxes(b) {
             if t == b"tkhd" {
                 out.push(payload.to_vec());
             }
-            // 容器盒继续下钻（moov/trak/edts 等）；tkhd/mdat 等叶子不用
-            find_tkhds(payload, out);
+            // mdat 等叶子盒绝不下钻
+            if is_container(t) {
+                find_tkhds(payload, depth + 1, out);
+            }
         }
     }
     let mut tkhds = Vec::new();
-    find_tkhds(b, &mut tkhds);
+    find_tkhds(b, 0, &mut tkhds);
     let mut best: Option<(u64, u32, u32)> = None;
     for p in tkhds {
         if p.len() >= 8 {
@@ -1262,6 +1287,44 @@ struct VidSnap {
     size: u64,
     range: Option<u64>,
     total_len: Option<u64>, // Content-Range 里的总大小
+}
+
+/// host 的注册主域（末两段），用于识别同一站点的不同 CDN 节点。
+/// 例：`upos-sz-estgcos.bilivideo.com` 与 `upos-sz-mirror08c.bilivideo.com` → 都是 `bilivideo.com`。
+fn reg_domain(host: &str) -> String {
+    let parts: Vec<&str> = host.split('.').collect();
+    let n = parts.len();
+    if n >= 2 {
+        format!("{}.{}", parts[n - 2], parts[n - 1])
+    } else {
+        host.to_string()
+    }
+}
+
+/// URL 的路径目录（去掉 scheme 与 host）。同一视频的各轨道（video/audio）目录通常
+/// 完全一致，是比 host 更稳的归类信号——B 站两条轨道就落在不同 CDN host 上。
+fn url_path_dir(u: &str) -> String {
+    let d = url_dir(u); // "https://host/a/b/"
+    match d.find("://") {
+        Some(i) => match d[i + 3..].find('/') {
+            Some(j) => d[i + 3 + j..].to_string(),
+            None => String::from("/"),
+        },
+        None => d.to_string(),
+    }
+}
+
+/// 该条目是否指向 HLS 播放列表（决定轨道临时文件的扩展名）。
+fn entry_is_hls(entry: &crate::capture::Entry) -> bool {
+    let (url, content_type) = {
+        let inner = entry.inner.lock().unwrap();
+        (entry.url.clone(), inner.content_type.clone())
+    };
+    url_path(&url).ends_with(".m3u8")
+        || content_type
+            .as_deref()
+            .map(|c| c.to_lowercase().contains("mpegurl"))
+            .unwrap_or(false)
 }
 
 /// 视频下载器：把抓包条目聚合为「可完整获取」的视频列表。
@@ -1648,7 +1711,9 @@ fn list_videos(app: &App) -> Response<Body> {
     for v in dash_items.iter_mut() {
         v.is_video = v.resolution.is_some();
     }
-    // 音视频轨配对：同 host、基名前缀（去掉最后一段码率/轨道号）相同，一视频一音频。
+    // 音视频轨配对：基名前缀（去掉最后一段码率/轨道号）相同，一视频一音频。
+    // host 判定不能要求完全相等——同一视频的视频/音频轨常被分发到不同 CDN 节点
+    // （B 站：estgcos / mirror08c 等）。改判「同 host，或同注册主域且 URL 目录相同」。
     // 仅在 ffmpeg 可用时启用（否则合并下载不可用，两条分开列）。
     let track_prefix = |n: &str| {
         n.rsplit_once('-')
@@ -1656,18 +1721,41 @@ fn list_videos(app: &App) -> Response<Body> {
             .unwrap_or_else(|| n.to_string())
     };
     if mux_available {
-        for i in 0..dash_items.len() {
-            if !dash_items[i].is_video || dash_items[i].audio_entry_id.is_some() {
+        let dirs: Vec<String> = dash_items.iter().map(|d| url_path_dir(&d.url)).collect();
+        let rdoms: Vec<String> = dash_items.iter().map(|d| reg_domain(&d.host)).collect();
+        // 同一视频抓到多档清晰度/多档音频时，优先给画质最高、码率最大的轨配对，
+        // 而不是按 BTreeMap 字典序先到先得（否则 4K 轨可能被配上 64K 音频）。
+        let area = |i: usize| -> u64 {
+            dash_items[i]
+                .resolution
+                .as_deref()
+                .and_then(|r| {
+                    let (a, b) = r.split_once('x')?;
+                    Some(a.parse::<u64>().ok()? * b.parse::<u64>().ok()?)
+                })
+                .unwrap_or(0)
+        };
+        let mut vorder: Vec<usize> = (0..dash_items.len())
+            .filter(|&i| dash_items[i].is_video)
+            .collect();
+        vorder.sort_by(|&a, &b| area(b).cmp(&area(a)).then(dash_items[b].size.cmp(&dash_items[a].size)));
+        let mut aorder: Vec<usize> = (0..dash_items.len())
+            .filter(|&i| !dash_items[i].is_video)
+            .collect();
+        aorder.sort_by(|&a, &b| dash_items[b].size.cmp(&dash_items[a].size));
+        for i in vorder {
+            if dash_items[i].audio_entry_id.is_some() {
                 continue;
             }
             let vp = track_prefix(&dash_items[i].name);
             let host = dash_items[i].host.clone();
-            if let Some(j) = (0..dash_items.len()).find(|&j| {
-                j != i
-                    && !dash_items[j].is_video
-                    && dash_items[j].audio_entry_id.is_none()
-                    && dash_items[j].host == host
+            let vdir = dirs[i].clone();
+            let rdom = rdoms[i].clone();
+            if let Some(j) = aorder.iter().copied().find(|&j| {
+                dash_items[j].audio_entry_id.is_none()
                     && track_prefix(&dash_items[j].name) == vp
+                    && (dash_items[j].host == host
+                        || (vdir.len() > 1 && dirs[j] == vdir && rdoms[j] == rdom))
             }) {
                 dash_items[i].size += dash_items[j].size;
                 dash_items[i].size_exact &= dash_items[j].size_exact;
