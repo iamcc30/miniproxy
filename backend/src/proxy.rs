@@ -42,8 +42,7 @@ pub async fn handle_proxy(
 fn finish_err(entry: &Arc<Entry>, store: &Arc<Store>, msg: String) {
     {
         let mut inner = entry.inner.lock().unwrap();
-        inner.error = Some(msg);
-        inner.done = true;
+        inner.finish(Some(msg));
     }
     store.push(entry.clone());
 }
@@ -104,6 +103,8 @@ async fn handle_tunnel(
                 // TLS 直通：纯 TCP 隧道记录（客户端照常与真实证书握手，不影响其使用）
                 let note = match bypass {
                     MitmDecision::BypassAuto => "TLS 直通（客户端证书固定，自动跳过）",
+                    MitmDecision::BypassOutbound => "TLS 直通（对端只支持旧式加密套件，自动跳过）",
+                    MitmDecision::BypassDirect => "直连（分流规则：跳过代理）",
                     _ => "TLS 直通（MITM 白名单）",
                 };
                 let entry = app.store.new_entry(
@@ -118,8 +119,9 @@ async fn handle_tunnel(
                     client,
                 );
                 app.store.push(entry.clone());
-                // 隧道类连接：读取当前生效的上游配置（界面里改了立即对新连接生效）
-                let upstream = app.upstream();
+                // 隧道类连接：读取当前上游配置（界面里改了立即对新连接生效），
+                // 并应用分流规则（命中「跳过代理」的目标直连源站）
+                let upstream = app.upstream_for(&host);
                 match dial::tcp_dial(upstream.as_ref(), host.as_str(), port).await {
                     Ok(remote) => crate::tcp::splice_tcp(peeked, remote, entry).await,
                     Err(e) => finish_err(&entry, &app.store, format!("连接目标失败: {}", e)),
@@ -140,7 +142,7 @@ async fn handle_tunnel(
             client,
         );
         app.store.push(entry.clone());
-        let upstream = app.upstream();
+        let upstream = app.upstream_for(&host);
         match dial::tcp_dial(upstream.as_ref(), host.as_str(), port).await {
             Ok(remote) => crate::tcp::splice_tcp(peeked, remote, entry).await,
             Err(e) => finish_err(&entry, &app.store, format!("连接目标失败: {}", e)),
@@ -152,6 +154,15 @@ async fn handle_tunnel(
 /// 任意一次握手成功都会清零计数，避免偶发中断被误判为证书固定。
 pub const AUTO_BYPASS_THRESHOLD: u32 = 3;
 
+/// 出站（MiniProxy -> 源站）TLS 握手失败自动直通的阈值。这类失败通常是
+/// 对端只提供旧式加密套件（CBC 系列），rustls 只实现 AEAD 套件、根本无法协商，
+/// 重试也不会成功，所以阈值取小而快。
+pub const OUTBOUND_BYPASS_THRESHOLD: u32 = 2;
+
+/// 出站不兼容导致的直通有效期：过期后重新尝试 MITM，
+/// 以免上游偶发掉线把可解密的站点永久变成隧道。
+pub const OUTBOUND_BYPASS_TTL_MS: u128 = 30 * 60 * 1000;
+
 #[derive(PartialEq)]
 pub enum MitmDecision {
     /// 允许 MITM 解密
@@ -160,15 +171,22 @@ pub enum MitmDecision {
     BypassStatic,
     /// 动态直通：客户端证书固定，握手失败次数达到阈值
     BypassAuto,
+    /// 动态直通：出站到源站的 TLS 协商不上（对端只支持旧式套件）
+    BypassOutbound,
+    /// 分流规则命中「跳过代理」：直连源站，并按设置决定是否跳过解密
+    BypassDirect,
 }
 
 /// 判断目标 host 是否允许 MITM 解密。
 ///
-/// 三层判定：
+/// 五层判定：
 /// 1. 静态白名单：Apple/iCloud 等已知证书固定或不信任用户 CA 的系统服务域名；
 /// 2. `MINIPROXY_NO_MITM=a.com,b.org` 追加白名单后缀；
-/// 3. 动态自动直通：同一域名 TLS 握手失败达 `AUTO_BYPASS_THRESHOLD` 次后自动跳过 MITM，
-///    让证书固定（pinning）的 App（微博、穿山甲广告 SDK 等）在代理下照常工作。
+/// 3. 分流规则「跳过代理」：直连源站，默认同样不解密；
+/// 4. 动态自动直通：同一域名 TLS 握手失败达 `AUTO_BYPASS_THRESHOLD` 次后自动跳过 MITM，
+///    让证书固定（pinning）的 App（微博、穿山甲广告 SDK 等）在代理下照常工作；
+/// 5. 出站不兼容直通：MiniProxy 自己到源站的握手失败（旧式加密套件），
+///    临时跳过 MITM，让站点以纯隧道方式照常访问（TTL 后重试）。
 fn mitm_decision(app: &App, host: &str) -> MitmDecision {
     const DEFAULT_BYPASS: &[&str] = &[
         "icloud.com",
@@ -183,19 +201,29 @@ fn mitm_decision(app: &App, host: &str) -> MitmDecision {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
-    let host = host.to_lowercase();
+    let host_lc = host.to_lowercase();
     let bypassed = DEFAULT_BYPASS
         .iter()
         .map(|s| s.to_string())
         .chain(extra)
-        .any(|suffix| host == suffix || host.ends_with(&format!(".{}", suffix)));
+        .any(|suffix| host_lc == suffix || host_lc.ends_with(&format!(".{}", suffix)));
     if bypassed {
         return MitmDecision::BypassStatic;
     }
+
+    let rules = app.rules_snapshot();
+    // 分流规则「跳过代理」：直连源站；默认连解密一起跳过（内网/自签证书站点居多）
+    if rules.route(host) == crate::rules::Route::Direct && rules.direct_skip_mitm() {
+        return MitmDecision::BypassDirect;
+    }
+
     if let Ok(m) = app.bypass_counts.lock() {
-        if m.get(&host).copied().unwrap_or(0) >= AUTO_BYPASS_THRESHOLD {
+        if m.get(&host_lc).copied().unwrap_or(0) >= AUTO_BYPASS_THRESHOLD {
             return MitmDecision::BypassAuto;
         }
+    }
+    if app.outbound_bypassed(&host_lc) {
+        return MitmDecision::BypassOutbound;
     }
     MitmDecision::Allow
 }
@@ -280,18 +308,23 @@ pub async fn handle_ws_upgrade(
     // 这样客户端只会收到一个 101（携带真实的 Sec-WebSocket-Accept）。
     // 出站必须和普通请求一样尊重「上游级联」配置：否则被墙站点的 WS
     // 升级会直连源站，表现为客户端握手一直挂到超时。
-    let upstream_cfg = app.upstream();
+    let upstream_cfg = app.upstream_for(&ohost);
     let upstream_result = async {
         let mut origin: Box<dyn DynStream> = {
             let tcp = dial::tcp_dial(upstream_cfg.as_ref(), &ohost, oport)
                 .await
                 .map_err(|e| format!("连接源站失败: {}", e))?;
             if tls {
-                Box::new(
-                    dial::tls_wrap(&ohost, tcp)
-                        .await
-                        .map_err(|e| format!("TLS 连接源站失败: {}", e))?,
-                )
+                match dial::tls_wrap(&ohost, tcp).await {
+                    Ok(s) => Box::new(s),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if crate::capture::io_error_is_tls_handshake(&e, &msg) {
+                            app.record_outbound_tls_failure(&ohost);
+                        }
+                        return Err(format!("TLS 连接源站失败: {}", msg));
+                    }
+                }
             } else {
                 Box::new(tcp)
             }

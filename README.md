@@ -13,6 +13,10 @@
 | 可视化界面 | SSE 实时推送、暂停/恢复、明暗主题切换（浅色/深色/跟随系统）、历史记录查看与 JSON/HAR 导出 |
 | 一键系统代理 | 界面右上角一键开启/关闭 macOS 系统代理（HTTP+HTTPS+SOCKS）；开启前自动备份原有代理配置，关闭时恢复，不破坏 Clash 等已有配置；**程序退出时（含 Ctrl+C、强杀、崩溃）自动恢复系统代理**，不会留下指向死端口的代理导致断网 |
 | 上游级联 | 出站流量经本机其他代理（Clash/Charles/Surge…）转发，HTTPS 仍被解密抓包。**三种配置方式**：界面「🔗 上游级联」一键检测/手填（改完立即生效）、环境变量 `MINIPROXY_UPSTREAM_PROXY`、从未配置时**启动自动探测**本机常见代理端口；设置持久化到 `~/.miniproxy/config.json`，启用前自动做连通性测试 |
+| 分流规则 | 界面「🚦 分流规则」配置哪些域名/IP **跳过代理直连源站**、哪些**强制走上游**；支持通配符、IP 通配与 CIDR 网段，内置私网/回环直连段。持久化到 `~/.miniproxy/config.json`，并在系统代理开启时同步进 macOS bypass 列表（浏览器等直接绕过 MiniProxy） |
+| 耗时可见 | 列表与详情面板显示每条请求的耗时（从收到请求到响应体读完），≥0.8s 标黄、≥3s 标红，配合 HAR 导出的 `time` 字段一起可用于定位慢请求 |
+| HTTP/2 | 客户端侧与出站侧都协商 h2，同一域名可多路复用，避免为每个请求重复握手；如需退回纯 HTTP/1.1 用 `MINIPROXY_NO_H2=1` |
+| 出站超时 | 连上游、等上游 CONNECT 响应、与源站做 TLS 握手都有超时（默认 10s / 连接 5s），上游节点丢包时快速失败并在界面标出原因，而不是无限等待把浏览器拖死 |
 
 ## 项目结构
 
@@ -28,7 +32,8 @@ miniproxy/
 │       ├── tcp.rs      # TCP 隧道记录
 │       ├── api.rs      # REST/SSE/导出/静态服务
 │       ├── peek.rs     # 首字节探测流包装
-│       ├── config.rs   # 持久化配置 ~/.miniproxy/config.json（上游级联等）
+│       ├── config.rs   # 持久化配置 ~/.miniproxy/config.json（上游级联 + 分流规则）
+│       ├── rules.rs    # 出站分流规则：跳过代理/强制走代理（通配符 + CIDR 匹配）
 │       ├── dial.rs     # 出站拨号：直连 / 上游 CONNECT 级联 / 本机代理自动探测
 │       └── util.rs     # 通用工具
 └── frontend/           # React + Vite + TypeScript
@@ -50,6 +55,8 @@ cargo run            # 默认代理端口 34567，界面端口 9000
 - `MINIPROXY_STATIC`：前端静态文件目录
 - `MINIPROXY_API_HOST`：界面/API 监听地址（默认 `127.0.0.1`；手机抓包设为 `0.0.0.0` 以便设备下载 CA 证书）
 - `MINIPROXY_UPSTREAM_PROXY`：上游级联代理（如 `http://127.0.0.1:7890`；优先级最高，会覆盖界面设置）
+- `MINIPROXY_DIAL_TIMEOUT_MS`（默认 10000）：出站「等待上游 CONNECT 响应」与「与源站 TLS 握手」的超时；连不上上游时 5s 内即失败
+- `MINIPROXY_NO_H2=1`：关闭 MITM 的 HTTP/2 协商，退回纯 HTTP/1.1（排查兼容性问题时用）
 
 其中「上游级联」无需改环境变量：界面右上角「🔗 上游级联」可随时开关/更换，运行期立即生效。
 
@@ -84,6 +91,30 @@ MINIPROXY_UPSTREAM_PROXY=http://127.0.0.1:7890 cargo run
 - HTTPS 依然被 MiniProxy 解密抓包（级联只影响出站路径，不影响 MITM）
 - 一键系统代理 + 上游级联组合：浏览器正常访问被墙站点，同时流量全部被抓包记录
 
+### 分流规则（哪些域名/IP 跳过代理、哪些走代理）
+
+界面右上角「🚦 分流规则」，两个列表每行一条，保存后**持久化到 `~/.miniproxy/config.json`**（重启沿用），
+改完立即对新连接生效：
+
+| 列表 | 作用 |
+|---|---|
+| **跳过代理（直连源站）** | 命中者不经上游级联，直接连源站；默认同时**不解密**（记录为隧道，Mode 标注「直连（分流规则：跳过代理）」），适内网/自签证书站点 |
+| **强制走代理** | 命中者强制经上游转发，**优先级最高**（覆盖「跳过代理」与内置直连段） |
+
+条目写法（大小写不敏感）：`example.com`（本域及子域）、`*.foo.com`、`api-*.foo.com`（`*` 通配）、
+`1.2.3.4`、`192.168.1.*`、`10.0.0.0/8`（CIDR，IPv4/IPv6 均可）。每个列表上限 500 条。
+
+**内置直连**（无需配置，可用「强制走代理」覆盖）：`localhost`、`*.local`、`127.0.0.0/8`、`::1`、
+`fe80::/10`、`fc00::/7`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16`、`100.64.0.0/10`。
+
+「跳过代理」的条目还会**同步进 macOS 系统代理的 bypass 列表**（`networksetup -setproxybypassdomains`），
+让浏览器 / curl / Electron 这类走系统网络栈的客户端**真的不把请求发给 MiniProxy**；
+同步时保留你原有的 bypass 条目，关闭系统代理时按原样恢复。自带网络栈的程序（Codex、Go/Rust 程序等）
+不读系统代理，但它们在规则命中时同样会被 MiniProxy 直连转发。
+
+API：`GET /api/rules`、`POST /api/rules`（`{"direct":[...],"proxied":[...],"directNoMitm":true}`）。
+注意：已建立的连接（含 hyper 连接池里的空闲连接）不受影响，与上游切换行为一致。
+
 ### MITM 白名单（TLS 直通域名）
 
 部分客户端会拒绝 MITM 证书（系统级证书固定、不信任用户 CA 等），例如
@@ -108,6 +139,16 @@ MINIPROXY_NO_MITM=pinning.example.com,other.example.org cargo run
 （`AUTO_BYPASS_THRESHOLD`），MiniProxy 会自动对该域名停止 MITM、改为直通隧道，
 客户端随即恢复正常联网（记录里 Mode 标注「TLS 直通（客户端证书固定，自动跳过）」）。
 任意一次握手成功会清零计数，避免偶发中断被误判。无需配置，进程内生效。
+
+**自动直通（源站只支持旧式加密套件）**：MiniProxy 出站用 rustls，只实现 AEAD 套件
+（GCM / ChaCha20），**没有 CBC 系列**。少数老旧站点（如 `www.bootstrapmb.com`，只提供
+`ECDHE-RSA-AES256-SHA384`）因此根本协商不上，表现为 502 且错误为
+`error trying to connect: tls handshake eof`。这类域名累计 2 次
+（`OUTBOUND_BYPASS_THRESHOLD`）后同样自动改为**隧道直通**：站点恢复正常访问，
+但该域名无法解密抓包。直通带 30 分钟有效期（`OUTBOUND_BYPASS_TTL_MS`），
+过期后重试 MITM，上游偶发掉线导致的误判会自愈。想立刻恢复解密可在界面点
+工具栏「🛡 自动直通 → 清空名单」（对应 `POST /api/bypass/clear`，
+`GET /api/bypass` 查看当前名单与原因）。
 
 ### 分组与「按组筛选」（默认不分组）
 
@@ -159,6 +200,12 @@ sudo security add-trusted-cert -d -r trustRoot \
 ```
 
 浏览器（Chrome/Safari）跟随系统钥匙串即可。**不安装 CA 时 HTTPS 流量将以 TCP 隧道形式记录（无法解密内容）。**
+
+> **如果启动日志提示「检测到旧证书带有非法的 SubjectAlternativeName 扩展，已重建」**：旧版本的 CA 误把 CN 写成了 DNS SAN（`DNS:MiniProxy Root CA`，含空格、非法），
+> 导致 OpenSSL 系客户端（curl / Node / Go / Python requests / git）以 `unsupported or invalid name syntax` 拒绝整条链。
+> 新版本会自动备份旧文件（`ca.crt.legacy-san.bak` / `ca.key.legacy-san.bak`）并重建 CA，**需要重新执行上面的信任命令**（旧证书在钥匙串里的信任项对它无效）。
+> 验证是否修好：`openssl verify -CAfile ~/.miniproxy/ca.crt <某条抓包导出的叶子证书>` 应输出 OK；或直接
+> `curl --cacert ~/.miniproxy/ca.crt -x http://127.0.0.1:34567 https://www.bing.com/` 能拿到状态码。
 
 ### 5. 开始抓包
 

@@ -18,7 +18,7 @@ where
         _ = up => {},
         _ = down => {},
     }
-    entry.inner.lock().unwrap().done = true;
+    entry.inner.lock().unwrap().finish(None);
 }
 
 async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(

@@ -6,13 +6,44 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hyper::Uri;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// 出站 TCP 连接（直连目标 或 连上游代理）的超时。
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 「上游 CONNECT 响应」与「出站 TLS 握手」的超时。
+///
+/// 这两个阶段以前是裸 await：上游节点丢包时（既不发响应也不发 RST）代理会无限期等待，
+/// 客户端只能干等到自己超时——表现为「开了代理后整页卡住转圈」。默认 10s，
+/// 可用 `MINIPROXY_DIAL_TIMEOUT_MS` 调整。
+fn dial_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("MINIPROXY_DIAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(10))
+    })
+}
+
+fn timed_out(what: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "{} 超时（{}ms，可用 MINIPROXY_DIAL_TIMEOUT_MS 调整）",
+            what,
+            dial_timeout().as_millis()
+        ),
+    )
+}
 
 /// 运行期可变的上游配置：界面里随时开关/换地址，无需重启进程。
 pub type SharedUpstream = Arc<RwLock<Option<Upstream>>>;
@@ -121,19 +152,30 @@ pub async fn tcp_dial(
 ) -> io::Result<TcpStream> {
     // 回环目标永远直连：本机服务经外部代理转发没有意义，还会被上游拒绝（表现为 502）
     if host == "localhost" || host == "::1" || host.starts_with("127.") {
-        return TcpStream::connect((host, port)).await;
+        return connect_timed(host, port).await;
     }
     match upstream {
-        None => TcpStream::connect((host, port)).await,
+        None => connect_timed(host, port).await,
         Some(up) => {
-            let mut tcp = TcpStream::connect((up.host.as_str(), up.port)).await?;
+            let mut tcp = connect_timed(&up.host, up.port).await?;
             let req = format!(
                 "CONNECT {h}:{p} HTTP/1.1\r\nHost: {h}:{p}\r\nProxy-Connection: keep-alive\r\n\r\n",
                 h = host,
                 p = port
             );
             tcp.write_all(req.as_bytes()).await?;
-            let code = read_connect_response(&mut tcp).await?;
+            let code = match tokio::time::timeout(dial_timeout(), read_connect_response(&mut tcp)).await
+            {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(timed_out(format!(
+                        "等待上游代理 {} 对 {}:{} 的 CONNECT 响应",
+                        up.addr(),
+                        host,
+                        port
+                    )))
+                }
+            };
             if code != 200 {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
@@ -142,6 +184,22 @@ pub async fn tcp_dial(
             }
             Ok(tcp)
         }
+    }
+}
+
+/// TCP 连接 + 超时（超时后 `TcpStream::connect` 的 future 被丢弃，连接不会建立）。
+async fn connect_timed(host: &str, port: u16) -> io::Result<TcpStream> {
+    match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "连接 {}:{} 超时（{}ms）",
+                host,
+                port,
+                TCP_CONNECT_TIMEOUT.as_millis()
+            ),
+        )),
     }
 }
 
@@ -174,23 +232,87 @@ async fn read_connect_response(tcp: &mut TcpStream) -> io::Result<u16> {
         .unwrap_or(0))
 }
 
-/// 在已建立的 TCP 连接上做 TLS 客户端握手（系统根证书校验）。
+/// 系统根证书库：进程内只加载一次。
+///
+/// 以前每次拨号都调 `load_native_certs()`（macOS 上要走钥匙串）+ 重建 `RootCertStore`
+/// （逐张校验上百张系统证书），而每个新出站连接都会走一次。一个页面几十个域名就是
+/// 几十次重复劳动，白白吃掉几十毫秒 × N。
+fn roots() -> Arc<rustls::RootCertStore> {
+    static R: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    R.get_or_init(|| {
+        let mut store = rustls::RootCertStore::empty();
+        match rustls_native_certs::load_native_certs() {
+            Ok(certs) => {
+                let mut n = 0usize;
+                for c in certs {
+                    if store.add(&rustls::Certificate(c.0)).is_ok() {
+                        n += 1;
+                    }
+                }
+                eprintln!("  出站 TLS 根证书: 已加载并缓存 {} 张系统证书", n);
+            }
+            Err(e) => eprintln!("  出站 TLS 根证书: 加载失败（{}），HTTPS 源站校验将失败", e),
+        }
+        Arc::new(store)
+    })
+    .clone()
+}
+
+fn build_client_config(alpn: Vec<Vec<u8>>) -> rustls::ClientConfig {
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates((*roots()).clone())
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn;
+    cfg
+}
+
+/// 供 hyper 客户端使用：ALPN 协商 h2，让出站也能享受 HTTP/2 多路复用。
+pub fn client_config_h2_ok() -> Arc<rustls::ClientConfig> {
+    static C: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    C.get_or_init(|| {
+        Arc::new(build_client_config(vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ]))
+    })
+    .clone()
+}
+
+/// 供「自己手写 HTTP/1.1 报文」的场景（WebSocket 升级）使用：ALPN 只允许 http/1.1。
+/// 若这里协商出 h2，源站会按 h2 帧来期待数据，手写的升级请求根本发不出去。
+fn client_config_http1_only() -> Arc<rustls::ClientConfig> {
+    static C: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    C.get_or_init(|| Arc::new(build_client_config(vec![b"http/1.1".to_vec()])))
+        .clone()
+}
+
+/// 在已建立的 TCP 连接上做 TLS 客户端握手（系统根证书校验），ALPN 只给 http/1.1。
 pub async fn tls_wrap(
     host: &str,
     tcp: TcpStream,
 ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs()? {
-        let _ = roots.add(&rustls::Certificate(cert.0));
-    }
-    let cfg = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+    tls_wrap_alpn(host, tcp, false).await
+}
+
+/// 同上，`h2_ok = true` 时 ALPN 额外提供 h2（供 hyper 客户端用）。
+pub async fn tls_wrap_alpn(
+    host: &str,
+    tcp: TcpStream,
+    h2_ok: bool,
+) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let cfg = if h2_ok {
+        client_config_h2_ok()
+    } else {
+        client_config_http1_only()
+    };
+    let connector = tokio_rustls::TlsConnector::from(cfg);
     let name = rustls::ServerName::try_from(host.to_string().as_str())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("无效主机名: {}", e)))?;
-    connector.connect(name, tcp).await
+    match tokio::time::timeout(dial_timeout(), connector.connect(name, tcp)).await {
+        Ok(r) => r,
+        Err(_) => Err(timed_out(format!("与 {} 完成 TLS 握手", host))),
+    }
 }
 
 /// hyper 客户端连接器返回的流：明文 TCP 或 TLS。
@@ -241,11 +363,31 @@ impl AsyncWrite for OriginStream {
 #[derive(Clone)]
 pub struct ProxyConnector {
     pub upstream: SharedUpstream,
+    /// 分流规则：命中「跳过代理」的目标直连源站（不进上游）
+    pub rules: crate::rules::SharedRules,
+}
+
+impl OriginStream {
+    /// 本连接是否通过 ALPN 协商到了 h2。
+    pub fn is_h2(&self) -> bool {
+        match self {
+            OriginStream::Plain(_) => false,
+            OriginStream::Tls(s) => s.get_ref().1.alpn_protocol() == Some(b"h2"),
+        }
+    }
 }
 
 impl hyper::client::connect::Connection for OriginStream {
     fn connected(&self) -> hyper::client::connect::Connected {
-        hyper::client::connect::Connected::new()
+        // 告知 hyper 这条连接协商到了 h2：hyper 客户端据此改用 HTTP/2 协议栈
+        // （见 hyper client.rs 里 `connected.alpn == Alpn::H2` 的分支），
+        // 否则同一个 TLS 会话上会按 HTTP/1.1 发请求，源站直接判为协议错误。
+        let c = hyper::client::connect::Connected::new();
+        if self.is_h2() {
+            c.negotiated_h2()
+        } else {
+            c
+        }
     }
 }
 
@@ -261,6 +403,10 @@ impl hyper::service::Service<Uri> for ProxyConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         // 每次拨号都读取当前配置：界面里切换上游后，新连接立即生效（已建立的连接不受影响）
         let upstream = self.upstream.read().ok().and_then(|g| g.clone());
+        // 分流规则同样每次读取：命中「跳过代理」的域名/IP 直连源站
+        let rules = self.rules.read().map(|g| g.clone()).unwrap_or_default();
+        let host = uri.host().unwrap_or("").to_string();
+        let upstream = rules.upstream_for(&host, upstream);
         Box::pin(async move { dial_for_uri(upstream.as_ref(), &uri).await })
     }
 }
@@ -277,7 +423,8 @@ pub async fn dial_for_uri(
     let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
     let tcp = tcp_dial(upstream, &host, port).await?;
     if https {
-        Ok(OriginStream::Tls(tls_wrap(&host, tcp).await?))
+        // 出站也协商 h2：Google 等站点全站 HTTP/2，降级到 H1 会失去多路复用
+        Ok(OriginStream::Tls(tls_wrap_alpn(&host, tcp, true).await?))
     } else {
         Ok(OriginStream::Plain(tcp))
     }

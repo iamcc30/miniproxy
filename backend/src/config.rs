@@ -1,9 +1,12 @@
 //! 持久化用户配置：~/.miniproxy/config.json
 //!
-//! 目前存放「上游级联」设置。字段用 Option 表达三态：
+//! 存放「上游级联」设置与「分流规则」。上游字段用 Option 表达三态：
 //! - `null`：从未设置过（允许启动时自动探测本机代理）
 //! - `true` + addr：用户显式启用某个上游（启动时沿用）
 //! - `false`：用户显式关闭（启动时不再自动探测，尊重用户选择）
+//!
+//! 分流规则（`direct` / `proxied` / `direct_no_mitm`）由 `rules::Rules` 使用，
+//! 详见 `rules.rs` 的条目写法说明。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,6 +19,26 @@ pub struct Config {
     /// 上游地址，形如 "127.0.0.1:7890"
     #[serde(default)]
     pub upstream_addr: Option<String>,
+    /// 跳过代理、直连源站的域名/IP
+    #[serde(default)]
+    pub direct: Vec<String>,
+    /// 强制走上游代理的域名/IP（优先级最高）
+    #[serde(default)]
+    pub proxied: Vec<String>,
+    /// 直连域名是否绕开 MITM 解密（默认 true）
+    #[serde(default)]
+    pub direct_no_mitm: Option<bool>,
+}
+
+impl Config {
+    /// 取出分流规则部分。
+    pub fn rules(&self) -> crate::rules::Rules {
+        crate::rules::Rules {
+            direct: self.direct.clone(),
+            proxied: self.proxied.clone(),
+            direct_no_mitm: self.direct_no_mitm,
+        }
+    }
 }
 
 pub fn path() -> PathBuf {

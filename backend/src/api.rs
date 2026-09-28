@@ -37,6 +37,10 @@ pub async fn handle_api(
         (&Method::GET, "/api/upstream") => upstream_status(&app),
         (&Method::POST, "/api/upstream") => upstream_set(req, &app).await,
         (&Method::POST, "/api/upstream/scan") => upstream_scan(&app).await,
+        (&Method::GET, "/api/bypass") => bypass_list(&app),
+        (&Method::POST, "/api/bypass/clear") => bypass_clear(&app),
+        (&Method::GET, "/api/rules") => rules_get(&app),
+        (&Method::POST, "/api/rules") => rules_set(req, &app).await,
         (&Method::GET, "/api/export") => export(req, &app),
         (&Method::GET, "/api/ca.crt") => ca_cert(&app),
         (&Method::GET, p) if p.starts_with("/api/entries/") && p.ends_with("/stitch") => {
@@ -1154,7 +1158,21 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
                 }
             }
             if !cands.is_empty() {
-                let proxy = app.upstream().map(|u| format!("http://{}", u.addr()));
+                // 分流规则同样生效：命中「跳过代理」的媒体域名直连拉取
+                let host_of = |u: &str| -> String {
+                    u.split("://")
+                        .nth(1)
+                        .and_then(|r| r.split('/').next())
+                        .unwrap_or("")
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let probe_host = host_of(&cands[0].0);
+                let proxy = app
+                    .upstream_for(&probe_host)
+                    .map(|u| format!("http://{}", u.addr()));
                 let vid = video_id.clone();
                 let taken = std::mem::take(&mut tracks);
                 let (tracks2, st) =
@@ -3166,7 +3184,7 @@ fn build_har(entries: &[Arc<crate::capture::Entry>]) -> String {
             }).unwrap_or(serde_json::json!([]));
             serde_json::json!({
                 "startedDateTime": started,
-                "time": inner.started_at.saturating_sub(e.ts),
+                "time": inner.duration_ms(e.ts),
                 "_kind": e.kind,
                 "_site": e.site,
                 "_client": e.client,
@@ -3344,7 +3362,10 @@ fn system_proxy_set(app: &App, enable: bool) -> Response<Body> {
         return json_response(serde_json::json!({"ok": false, "error": "当前平台不支持"}));
     }
     let result = if enable {
-        crate::sysproxy::enable(app.proxy_port)
+        // 开启系统代理时同时写入分流规则里「跳过代理」的条目，
+        // 让浏览器等走系统网络栈的客户端真的绕过 MiniProxy
+        let bypass = app.rules_snapshot().system_bypass_entries();
+        crate::sysproxy::enable(app.proxy_port, &bypass)
     } else {
         crate::sysproxy::disable()
     };
@@ -3367,6 +3388,146 @@ fn upstream_status(app: &App) -> Response<Body> {
         "addr": up.as_ref().map(|u| u.addr()),
         "source": app.upstream_source(),
         "envAddr": env_set,
+    }))
+}
+
+/// 当前被自动直通的域名名单：含原因（客户端拒绝证书 / 对端 TLS 不兼容）、
+/// 失败计数与各自阈值。
+fn bypass_list(app: &App) -> Response<Body> {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Ok(m) = app.bypass_counts.lock() {
+        for (h, c) in m.iter() {
+            items.push(serde_json::json!({ "host": h, "count": c, "reason": "client" }));
+        }
+    }
+    if let Ok(m) = app.outbound_tls_failures.lock() {
+        for (h, (c, _)) in m.iter() {
+            items.push(serde_json::json!({ "host": h, "count": c, "reason": "outbound" }));
+        }
+    }
+    items.sort_by(|a, b| {
+        b["count"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["count"].as_u64().unwrap_or(0))
+    });
+    json_response(serde_json::json!({
+        "items": items,
+        "threshold": crate::proxy::AUTO_BYPASS_THRESHOLD,
+        "outboundThreshold": crate::proxy::OUTBOUND_BYPASS_THRESHOLD,
+    }))
+}
+
+/// 清空自动直通名单：此后所有域名重新尝试 MITM 解密。
+fn bypass_clear(app: &App) -> Response<Body> {
+    let cleared = app
+        .bypass_counts
+        .lock()
+        .map(|mut m| {
+            let n = m.len();
+            m.clear();
+            n
+        })
+        .unwrap_or(0)
+        + app
+            .outbound_tls_failures
+            .lock()
+            .map(|mut m| {
+                let n = m.len();
+                m.clear();
+                n
+            })
+            .unwrap_or(0);
+    json_response(serde_json::json!({ "ok": true, "cleared": cleared }))
+}
+
+/// 读取当前分流规则（哪些域名/IP 跳过代理、哪些强制走代理）。
+fn rules_get(app: &App) -> Response<Body> {
+    let r = app.rules_snapshot();
+    let bypass = r.system_bypass_entries();
+    json_response(serde_json::json!({
+        "direct": r.direct,
+        "proxied": r.proxied,
+        "directNoMitm": r.direct_skip_mitm(),
+        "systemProxyOn": crate::sysproxy::is_on(),
+        "systemBypass": bypass,
+        "builtinDirect": [
+            "localhost / *.local",
+            "127.0.0.0/8、::1、fe80::/10、fc00::/7",
+            "10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、169.254.0.0/16、100.64.0.0/10"
+        ],
+    }))
+}
+
+/// 保存分流规则：立即生效 + 写入 ~/.miniproxy/config.json（重启后沿用）；
+/// 若系统代理已开启，同时把「跳过代理」的条目同步进系统代理的 bypass 列表。
+async fn rules_set(req: Request<Body>, app: &App) -> Response<Body> {
+    let body = hyper::body::to_bytes(req.into_body())
+        .await
+        .unwrap_or_default();
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(serde_json::json!({
+                "ok": false,
+                "error": format!("请求体不是合法 JSON: {}", e),
+            }))
+        }
+    };
+
+    let list_of = |key: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(arr) = v.get(key).and_then(|a| a.as_array()) {
+            for it in arr {
+                let s = it.as_str().unwrap_or("").trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let key_lc = s.to_lowercase();
+                if !out.iter().any(|x| x.to_lowercase() == key_lc) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        out
+    };
+
+    let direct = list_of("direct");
+    let proxied = list_of("proxied");
+    if direct.len() > 500 || proxied.len() > 500 {
+        return json_response(serde_json::json!({
+            "ok": false,
+            "error": "每个列表最多 500 条",
+        }));
+    }
+    let direct_no_mitm = v
+        .get("directNoMitm")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true);
+
+    let r = crate::rules::Rules {
+        direct,
+        proxied,
+        direct_no_mitm: Some(direct_no_mitm),
+    };
+    let bypass = r.system_bypass_entries();
+    app.set_rules(r);
+    app.save_config();
+
+    // 系统代理已开启时同步 bypass 列表，让浏览器等客户端也真的绕过 MiniProxy
+    let mut warn: Option<String> = None;
+    let sys_on = crate::sysproxy::is_on();
+    if sys_on {
+        if let Err(e) = crate::sysproxy::sync_bypass(&bypass) {
+            warn = Some(format!("规则已保存，但写入系统代理 bypass 列表失败: {}", e));
+        }
+    }
+
+    json_response(serde_json::json!({
+        "ok": true,
+        "directCount": bypass.len(),
+        "systemProxyOn": sys_on,
+        "warning": warn,
     }))
 }
 

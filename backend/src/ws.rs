@@ -130,7 +130,7 @@ where
     }
     {
         let mut inner = entry.inner.lock().unwrap();
-        inner.done = true;
+        inner.finish(None);
         inner.ws_closed = true;
     }
 }

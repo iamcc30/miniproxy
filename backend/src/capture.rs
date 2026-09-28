@@ -87,12 +87,32 @@ pub struct EntryInner {
     pub bytes_down: u64,
     pub error: Option<String>,
     pub started_at: u128,
+    /// 本条结束（`done = true`）的时刻。耗时统计靠它：以前只有 `started_at`，
+    /// 且它在建条目后再没被更新过，导致 `durationMs` 恒为 0。
+    pub finished_at: Option<u128>,
     /// 关键词搜索用的「正文小写缓存」：`(内容指纹, 小写文本)`。
     /// 首次搜索时按需构建，内容变化（指纹变化）后自动重建，避免每次按键全量转码。
     pub search_cache: Option<(u64, Arc<String>)>,
 }
 
 impl EntryInner {
+    /// 标记本条结束：`done` 与结束时刻一起设置，供 `durationMs` 计算。
+    /// 所有把条目置为「完成」的地方都应走这里，不要只写 `done = true`。
+    pub fn finish(&mut self, error: Option<String>) {
+        if error.is_some() {
+            self.error = error;
+        }
+        self.finished_at = Some(now_ms());
+        self.done = true;
+    }
+
+    /// 本条耗时（毫秒）。未结束的条目按「到现在为止」计算。
+    pub fn duration_ms(&self, entry_ts: u128) -> u128 {
+        self.finished_at
+            .unwrap_or_else(now_ms)
+            .saturating_sub(entry_ts)
+    }
+
     /// 搜索内容指纹：只取各来源的长度/状态等廉价特征。
     /// 正文各字段在生命周期内只写入一次（请求体在建立条目时、响应体在流结束时），
     /// 因此长度 + 状态 + WS 条数足以可靠地判定缓存是否过期。
@@ -189,6 +209,7 @@ impl Store {
                 bytes_down: 0,
                 error: None,
                 started_at: now_ms(),
+                finished_at: None,
                 search_cache: None,
             }),
         })
@@ -226,6 +247,46 @@ pub fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// 文案特征判断：是否为 TLS 握手/协商阶段的失败。
+fn msg_looks_like_tls_handshake(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("tls handshake")
+        || m.contains("handshake failure")
+        || m.contains("fatal alert")
+        || m.contains("no ciphersuite")
+        || m.contains("cipher suites")
+        || m.contains("unexpected eof")
+}
+
+/// io::Error 是否为「TLS 握手阶段就失败」。
+pub fn io_error_is_tls_handshake(e: &std::io::Error, msg: &str) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+    ) || msg_looks_like_tls_handshake(msg)
+}
+
+/// 出站错误是否为「TLS 握手阶段就失败」。
+///
+/// 典型两例：
+/// - 源站只提供 CBC 系列套件（如 `ECDHE-RSA-AES256-SHA384`），rustls 只实现 AEAD，
+///   协商不上、对端直接关连接 → `tls handshake eof`（io kind = UnexpectedEof）；
+/// - 对端回 `handshake_failure` 告警 → tokio-rustls 包成 InvalidData，文案含 `fatal alert`。
+///
+/// 这两类都属于「重试也不会成功」，值得记入直通计数；而上游超时、连接被拒等不算。
+pub fn is_outbound_tls_handshake_error(e: &hyper::Error, msg: &str) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(ioe) = s.downcast_ref::<std::io::Error>() {
+            if io_error_is_tls_handshake(ioe, msg) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+    msg_looks_like_tls_handshake(msg)
+}
+
 /// 摘要 JSON（列表 / SSE）。
 pub fn summary_json(e: &Entry) -> serde_json::Value {
     let rtype = resource_type(e);
@@ -251,6 +312,7 @@ pub fn summary_json(e: &Entry) -> serde_json::Value {
         "wsMessages": inner.ws_messages.len(),
         "wsClosed": inner.ws_closed,
         "done": inner.done,
+        "durationMs": inner.duration_ms(e.ts),
         "error": inner.error,
     })
 }
@@ -292,7 +354,7 @@ pub fn detail_json(e: &Entry) -> serde_json::Value {
         "bytesDown": inner.bytes_down,
         "done": inner.done,
         "error": inner.error,
-        "durationMs": (inner.started_at.saturating_sub(e.ts)),
+        "durationMs": inner.duration_ms(e.ts),
     })
 }
 
@@ -740,20 +802,40 @@ pub async fn capture_and_forward(
     };
 
     let resp = match app.client.request(fwd).await {
-        Ok(r) => r,
+        Ok(r) => {
+            // 出站正常：清掉该域名的出站握手失败计数（偶发失败自愈）
+            app.clear_outbound_tls_failure(&host);
+            r
+        }
         Err(e) => {
+            let raw = e.to_string();
+            let tls_failed = is_outbound_tls_handshake_error(&e, &raw);
+            let auto = tls_failed && app.record_outbound_tls_failure(&host);
+            let msg = if tls_failed {
+                format!(
+                    "{}{}",
+                    raw,
+                    if auto {
+                        format!(
+                            "（源站只支持旧式加密套件，rustls 无法协商；{} 已自动改为隧道直通，\
+                             刷新即可正常访问，但该站点无法解密）",
+                            host
+                        )
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                raw
+            };
             {
                 let mut inner = entry.inner.lock().unwrap();
-                inner.error = Some(e.to_string());
-                inner.done = true;
+                inner.finish(Some(msg.clone()));
             }
             app.store.push(entry.clone());
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!(
-                    "MiniProxy: 上游请求失败: {}\n",
-                    e
-                )))
+                .body(Body::from(format!("MiniProxy: 上游请求失败: {}\n", msg)))
                 .unwrap();
         }
     };
@@ -816,7 +898,7 @@ pub async fn capture_and_forward(
             inner.resp_body = Some(acc);
             inner.resp_decoded = decoded;
             inner.resp_truncated = trunc;
-            inner.done = true;
+            inner.finish(None);
         }
         store2.push(e2);
     });
@@ -830,8 +912,7 @@ pub async fn capture_and_forward(
 fn error_response(entry: Arc<Entry>, msg: String) -> Response<Body> {
     {
         let mut inner = entry.inner.lock().unwrap();
-        inner.error = Some(msg.clone());
-        inner.done = true;
+        inner.finish(Some(msg.clone()));
     }
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)

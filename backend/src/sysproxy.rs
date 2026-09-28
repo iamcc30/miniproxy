@@ -36,6 +36,9 @@ pub struct ServiceState {
     pub http: Option<(String, u16)>,
     pub https: Option<(String, u16)>,
     pub socks: Option<(String, u16)>,
+    /// 开启前的 bypass 域名列表（关闭时原样恢复）
+    #[serde(default)]
+    pub bypass: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -192,6 +195,82 @@ fn get_proxy(service: &str, kind: &str) -> Option<(String, u16)> {
     parse_proxy_output(&out)
 }
 
+/// 读取某网络服务当前的 bypass 域名列表。
+/// `networksetup` 在列表为空时输出一句说明文案，需要过滤掉。
+pub fn get_bypass(service: &str) -> Vec<String> {
+    let out = match run("networksetup", &["-getproxybypassdomains", service]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let mut list = Vec::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let lc = l.to_lowercase();
+        if lc.starts_with("there aren't any") || lc.contains("bypass domains") {
+            continue;
+        }
+        list.push(l.to_string());
+    }
+    list
+}
+
+/// 写入某网络服务的 bypass 域名列表（空列表用 macOS 规定的占位符 `Empty` 清空）。
+fn set_bypass(service: &str, entries: &[String]) -> Result<(), String> {
+    if entries.is_empty() {
+        return run(
+            "networksetup",
+            &["-setproxybypassdomains", service, "Empty"],
+        )
+        .map(|_| ());
+    }
+    let mut args: Vec<&str> = vec!["-setproxybypassdomains", service];
+    for e in entries {
+        args.push(e.as_str());
+    }
+    run("networksetup", &args).map(|_| ())
+}
+
+/// 把「跳过代理」规则同步进系统代理的 bypass 列表（系统代理已开启时调用）。
+///
+/// 以开启时的备份为基准：`原始 bypass ∪ 规则条目`，避免多次保存规则后条目不断累积。
+pub fn sync_bypass(entries: &[String]) -> Result<(), String> {
+    let path = backup_path();
+    let backup: Option<Backup> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let originals: Vec<(String, Vec<String>)> = match backup {
+        Some(b) => b.services.into_iter().map(|s| (s.name, s.bypass)).collect(),
+        None => list_services()?
+            .into_iter()
+            .map(|n| {
+                let b = get_bypass(&n);
+                (n, b)
+            })
+            .collect(),
+    };
+
+    let mut errs = Vec::new();
+    for (name, orig) in originals {
+        let mut list = orig.clone();
+        for e in entries {
+            if !list.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                list.push(e.clone());
+            }
+        }
+        if let Err(e) = set_bypass(&name, &list) {
+            errs.push(format!("{}: {}", name, e));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("；"))
+    }
+}
+
 pub fn status() -> Result<Vec<ServiceState>, String> {
     let services = list_services()?;
     Ok(services
@@ -200,16 +279,21 @@ pub fn status() -> Result<Vec<ServiceState>, String> {
             http: get_proxy(&name, "-getwebproxy"),
             https: get_proxy(&name, "-getsecurewebproxy"),
             socks: get_proxy(&name, "-getsocksfirewallproxy"),
+            bypass: get_bypass(&name),
             name,
         })
         .collect())
 }
 
-/// 将所有网络服务的 HTTP / HTTPS（及 SOCKS）代理指向 127.0.0.1:port。
-/// 开启前备份现有配置。
-pub fn enable(port: u16) -> Result<(), String> {
+/// 将所有网络服务的 HTTP / HTTPS（及 SOCKS）代理指向 127.0.0.1:port，
+/// 并把 `extra_bypass`（分流规则里「跳过代理」的条目）追加进 bypass 列表。
+/// 开启前备份现有配置（含原 bypass 列表），关闭时原样恢复。
+pub fn enable(port: u16, extra_bypass: &[String]) -> Result<(), String> {
     let services = status()?;
-    let backup = Backup { port, services };
+    let backup = Backup {
+        port,
+        services: services.clone(),
+    };
     let path = backup_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -229,6 +313,22 @@ pub fn enable(port: u16) -> Result<(), String> {
         }
         // SOCKS 失败不视为致命（部分服务不支持）
         let _ = run("networksetup", &["-setsocksfirewallproxy", &s, "127.0.0.1", &port_s]);
+
+        // bypass：保留用户原有条目 + 追加分流规则里「跳过代理」的条目
+        let mut list = services
+            .iter()
+            .find(|x| x.name == s)
+            .map(|x| x.bypass.clone())
+            .unwrap_or_default();
+        for e in extra_bypass {
+            if !list.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                list.push(e.clone());
+            }
+        }
+        if let Err(e) = set_bypass(&s, &list) {
+            // bypass 写失败不影响代理本身可用，只记提示
+            eprintln!("[miniproxy] 设置 {} 的 bypass 列表失败: {}", s, e);
+        }
     }
     if errs.is_empty() {
         SYS_PROXY_ON.store(true, Ordering::SeqCst);
@@ -256,6 +356,10 @@ pub fn disable() -> Result<(), String> {
                 restore_service(&s.name, s.http.clone(), "-setwebproxy", "-setwebproxystate", &mut errs);
                 restore_service(&s.name, s.https.clone(), "-setsecurewebproxy", "-setsecurewebproxystate", &mut errs);
                 restore_service(&s.name, s.socks.clone(), "-setsocksfirewallproxy", "-setsocksfirewallproxystate", &mut errs);
+                // 恢复开启前的 bypass 列表
+                if let Err(e) = set_bypass(&s.name, &s.bypass) {
+                    errs.push(format!("{}: {}", s.name, e));
+                }
             }
             let _ = std::fs::remove_file(&path);
         }

@@ -9,6 +9,7 @@
 //! - peek    : 支持回吐首字节的流包装（用于协议探测）
 //! - api     : REST/SSE/导出/静态文件服务
 //! - sysproxy: 一键设置/恢复系统代理
+//! - rules   : 出站分流规则（哪些域名/IP 跳过代理、哪些强制走代理）
 
 mod api;
 mod attrib;
@@ -18,6 +19,7 @@ mod config;
 mod dial;
 mod peek;
 mod proxy;
+mod rules;
 mod sysproxy;
 mod tcp;
 mod util;
@@ -45,6 +47,11 @@ pub struct App {
     /// 各域名 TLS 握手失败计数：达到阈值（proxy::AUTO_BYPASS_THRESHOLD）后自动直通，
     /// 让证书固定（pinning）的 App 在代理下照常工作。
     pub bypass_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// 出站 TLS 握手失败：域名 -> (失败次数, 最近失败时间)。对端只支持旧式加密套件
+    /// （rustls 无法协商）时，达到阈值后临时直通，避免站点整个不可用。
+    pub outbound_tls_failures: std::sync::Mutex<std::collections::HashMap<String, (u32, u128)>>,
+    /// 出站分流规则：哪些域名/IP 跳过代理（直连）、哪些强制走代理。界面可改、持久化。
+    pub rules: rules::SharedRules,
 }
 
 impl App {
@@ -60,6 +67,37 @@ impl App {
     pub fn clear_tls_failure(&self, host: &str) {
         let mut m = self.bypass_counts.lock().unwrap();
         m.remove(&host.to_lowercase());
+    }
+
+    /// 记录一次「出站 TLS 握手失败」（MiniProxy 到源站）。
+    pub fn record_outbound_tls_failure(&self, host: &str) -> bool {
+        let mut m = self.outbound_tls_failures.lock().unwrap();
+        let e = m.entry(host.to_lowercase()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = crate::capture::now_ms();
+        e.0 >= proxy::OUTBOUND_BYPASS_THRESHOLD
+    }
+
+    /// 出站请求成功：清掉该域名的出站失败计数（偶发中断可自愈）。
+    pub fn clear_outbound_tls_failure(&self, host: &str) {
+        let mut m = self.outbound_tls_failures.lock().unwrap();
+        m.remove(&host.to_lowercase());
+    }
+
+    /// 该域名是否应因「对端 TLS 不兼容」而临时直通（TTL 内有效，过期后重试 MITM）。
+    pub fn outbound_bypassed(&self, host: &str) -> bool {
+        let now = crate::capture::now_ms();
+        let m = match self.outbound_tls_failures.lock() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        match m.get(&host.to_lowercase()) {
+            Some((c, t)) => {
+                *c >= proxy::OUTBOUND_BYPASS_THRESHOLD
+                    && now.saturating_sub(*t) < proxy::OUTBOUND_BYPASS_TTL_MS
+            }
+            None => false,
+        }
     }
 
     /// 当前生效的上游代理（None = 直连）。
@@ -86,14 +124,47 @@ impl App {
 
     /// 把上游设置持久化到 ~/.miniproxy/config.json，下次启动沿用。
     pub fn save_upstream_config(&self) {
+        self.save_config();
+    }
+
+    /// 把「上游级联 + 分流规则」一起写盘（两者共用一个配置文件，必须整体写，
+    /// 否则保存其一会把另一部分冲掉）。
+    pub fn save_config(&self) {
         let up = self.upstream();
+        let r = self.rules_snapshot();
+        let direct_no_mitm = r.direct_skip_mitm();
         let cfg = config::Config {
             upstream_enabled: Some(up.is_some()),
             upstream_addr: up.as_ref().map(|u| u.addr()),
+            direct: r.direct,
+            proxied: r.proxied,
+            direct_no_mitm: Some(direct_no_mitm),
         };
         if let Err(e) = config::save(&cfg) {
-            eprintln!("  保存上游配置失败: {}", e);
+            eprintln!("  保存配置失败: {}", e);
         }
+    }
+
+    /// 当前分流规则快照。
+    pub fn rules_snapshot(&self) -> rules::Rules {
+        self.rules.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 替换分流规则（运行期立即生效）。
+    pub fn set_rules(&self, r: rules::Rules) {
+        if let Ok(mut g) = self.rules.write() {
+            *g = r;
+        }
+    }
+
+    /// 该 host 的路由结论（分流规则 + 内置直连段）。
+    pub fn route_of(&self, host: &str) -> rules::Route {
+        self.rules_snapshot().route(host)
+    }
+
+    /// 该 host 实际要用的上游代理：命中「跳过代理」则为 None（直连源站）。
+    pub fn upstream_for(&self, host: &str) -> Option<dial::Upstream> {
+        self.rules_snapshot().upstream_for(host, self.upstream())
     }
 }
 
@@ -183,10 +254,12 @@ async fn main() {
     let api_host = std::env::var("MINIPROXY_API_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let upstream = resolve_upstream();
     let lan_ip = detect_lan_ip();
+    let rules_cfg = config::load().rules();
 
     let store = Arc::new(Store::new(5000));
     let ca = Arc::new(ca::Ca::load_or_create().expect("初始化本地 CA 失败"));
-    let client = build_http_client(upstream.shared.clone());
+    let rules = Arc::new(std::sync::RwLock::new(rules_cfg.clone()));
+    let client = build_http_client(upstream.shared.clone(), rules.clone());
 
     println!("==============================================");
     println!("  MiniProxy 抓包代理");
@@ -224,7 +297,18 @@ async fn main() {
         upstream: upstream.shared.clone(),
         upstream_source: std::sync::Mutex::new(upstream.source.clone()),
         bypass_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        outbound_tls_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+        rules,
     });
+
+    if !rules_cfg.direct.is_empty() || !rules_cfg.proxied.is_empty() {
+        println!(
+            "  分流规则      : 跳过代理 {} 条 / 强制走代理 {} 条（界面「🚦 分流规则」可改）",
+            rules_cfg.direct.len(),
+            rules_cfg.proxied.len()
+        );
+        println!("==============================================");
+    }
 
     // API + 静态界面服务
     {
@@ -329,8 +413,11 @@ async fn main() {
     println!("MiniProxy 已退出。");
 }
 
-fn build_http_client(upstream: dial::SharedUpstream) -> HttpClient {
-    let connector = dial::ProxyConnector { upstream };
+fn build_http_client(
+    upstream: dial::SharedUpstream,
+    rules: rules::SharedRules,
+) -> HttpClient {
+    let connector = dial::ProxyConnector { upstream, rules };
     Client::builder().build(connector)
 }
 
