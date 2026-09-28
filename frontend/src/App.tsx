@@ -28,6 +28,13 @@ import {
   fetchFacets,
   fetchInfo,
   fetchSysProxy,
+  fetchBypass,
+  clearBypass,
+  BypassItem,
+  fetchRules,
+  saveRules,
+  RulesState,
+  formatMs,
   fetchUpstream,
   fetchVideos,
   formatDuration,
@@ -77,6 +84,70 @@ function ThemeToggle() {
 }
 
 /* ---------------- 上游级联开关 ---------------- */
+/* ---------------- 导出 / 证书 下拉 ---------------- */
+function ExportMenu({ query }: { query: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+  return (
+    <div className="upstream-wrap" ref={ref}>
+      <button
+        className={`btn ghost${open ? ' soft' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="导出抓包内容 / 下载 CA 证书"
+      >
+        <span>⬇</span>
+        <span className="btn-label">导出</span>
+        <span className="ms-caret">▾</span>
+      </button>
+      {open && (
+        <div className="upstream-pop export-pop" role="menu">
+          <a
+            className="export-item"
+            role="menuitem"
+            href={`/api/export?format=json&${query}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() => setOpen(false)}
+          >
+            导出 JSON
+          </a>
+          <a
+            className="export-item"
+            role="menuitem"
+            href={`/api/export?format=har&${query}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() => setOpen(false)}
+          >
+            导出 HAR（含正文）
+          </a>
+          <div className="export-sep" />
+          <a
+            className="export-item"
+            role="menuitem"
+            href="/api/ca.crt"
+            download="miniproxy-ca.crt"
+            title="安装到系统/浏览器以解密 HTTPS"
+            onClick={() => setOpen(false)}
+          >
+            🔐 下载 CA 证书
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function UpstreamControl() {
   const [st, setSt] = useState<UpstreamStatus | null>(null);
   const [open, setOpen] = useState(false);
@@ -155,7 +226,7 @@ function UpstreamControl() {
   return (
     <div className="upstream-wrap" ref={wrapRef}>
       <button
-        className={`btn ${enabled ? 'primary' : ''}`}
+        className={`btn ghost${enabled ? ' soft' : ''}`}
         onClick={() => setOpen((o) => !o)}
         title={
           enabled
@@ -163,7 +234,18 @@ function UpstreamControl() {
             : '未启用上游级联：被墙/海外站点的 TLS 握手会失败，点此一键检测本机代理并级联'
         }
       >
-        {enabled ? `🔗 上游 ${st?.addr}` : '🔗 上游级联'}
+        {enabled ? (
+          <>
+            <span>🔗</span>
+            <span className="btn-label">上游</span>
+            <span>{st?.addr}</span>
+          </>
+        ) : (
+          <>
+            <span>🔗</span>
+            <span className="btn-label">上游级联</span>
+          </>
+        )}
       </button>
       {open && (
         <div className="upstream-pop">
@@ -211,6 +293,251 @@ function UpstreamControl() {
               当前由环境变量 MINIPROXY_UPSTREAM_PROXY={st.envAddr} 指定，优先级最高
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- 自动直通名单 ---------------- */
+function BypassControl() {
+  const [items, setItems] = useState<BypassItem[]>([]);
+  const [threshold, setThreshold] = useState(3);
+  const [outboundThreshold, setOutboundThreshold] = useState(2);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const refresh = useCallback(() => {
+    fetchBypass()
+      .then((d) => {
+        setItems(d.items);
+        setThreshold(d.threshold);
+        setOutboundThreshold(d.outboundThreshold ?? 2);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  // 点击浮层外部关闭
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const clear = async () => {
+    setBusy(true);
+    try {
+      const r = await clearBypass();
+      setMsg(`已清空 ${r.cleared} 个域名的直通记录，后续连接将重新尝试解密`);
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const active = items.filter((i) =>
+    i.count >= (i.reason === 'outbound' ? outboundThreshold : threshold)
+  );
+  return (
+    <div className="upstream-wrap" ref={wrapRef}>
+      <button
+        className={`btn ghost${active.length ? ' soft' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        title={
+          active.length
+            ? `${active.length} 个域名被自动直通（不再解密），点击查看/清空`
+            : '没有域名被自动直通，全部正常解密'
+        }
+      >
+        <span>🛡</span>
+        <span className="btn-label">自动直通</span>
+        {active.length > 0 && <span>{active.length}</span>}
+      </button>
+      {open && (
+        <div className="upstream-pop">
+          <div className="upstream-pop-title">自动直通名单</div>
+          <div className="upstream-pop-desc">
+            两种原因会跳过解密、只记 TCP 隧道：① 客户端拒绝 MITM 证书（累计 {threshold} 次，
+            通常是 App 做了证书固定）；② 源站只提供旧式加密套件、rustls 无法协商（累计{' '}
+            {outboundThreshold} 次，这类站点只能以隧道方式访问）。清空后都会重新尝试解密。
+          </div>
+          {active.length === 0 ? (
+            <div className="upstream-msg ok">（空）没有域名被自动直通</div>
+          ) : (
+            <div className="upstream-candidates">
+              {active.map((i) => (
+                <span
+                  key={`${i.reason}-${i.host}`}
+                  className="chip-btn"
+                  style={{ cursor: 'default' }}
+                  title={
+                    i.reason === 'outbound'
+                      ? `MiniProxy 到该站握手失败 ${i.count} 次（旧式加密套件，无法解密）`
+                      : `客户端握手失败 ${i.count} 次（证书固定/拒绝 MITM 证书）`
+                  }
+                >
+                  {i.host} ×{i.count}
+                  {i.reason === 'outbound' ? ' · 旧式套件' : ''}
+                </span>
+              ))}
+            </div>
+          )}
+          {active.length > 0 && (
+            <div className="upstream-pop-row">
+              <button className="btn danger" disabled={busy} onClick={clear}>
+                {busy ? '清空中…' : '清空名单'}
+              </button>
+            </div>
+          )}
+          {msg && <div className="upstream-msg ok">{msg}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- 分流规则（跳过代理 / 走代理） ---------------- */
+function RulesControl() {
+  const [st, setSt] = useState<RulesState | null>(null);
+  const [open, setOpen] = useState(false);
+  const [directText, setDirectText] = useState('');
+  const [proxiedText, setProxiedText] = useState('');
+  const [noMitm, setNoMitm] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err' | 'warn'; text: string } | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const apply = useCallback((d: RulesState) => {
+    setSt(d);
+    setDirectText(d.direct.join('\n'));
+    setProxiedText(d.proxied.join('\n'));
+    setNoMitm(d.directNoMitm);
+  }, []);
+
+  useEffect(() => {
+    fetchRules().then(apply).catch(() => {});
+  }, [apply]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const parseLines = (s: string) =>
+    s
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  const save = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const r = await saveRules({
+        direct: parseLines(directText),
+        proxied: parseLines(proxiedText),
+        directNoMitm: noMitm,
+      });
+      if (!r.ok) {
+        setMsg({ kind: 'err', text: r.error || '保存失败' });
+      } else if (r.warning) {
+        setMsg({ kind: 'warn', text: r.warning });
+      } else {
+        setMsg({
+          kind: 'ok',
+          text: r.systemProxyOn
+            ? `已保存并已同步到系统代理 bypass（${r.directCount ?? 0} 条），对新连接立即生效`
+            : `已保存，对新连接立即生效（系统代理未开启，未写入系统 bypass）`,
+        });
+      }
+      const d = await fetchRules();
+      apply(d);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const nDirect = st?.direct.length ?? 0;
+  const nProxied = st?.proxied.length ?? 0;
+  return (
+    <div className="upstream-wrap" ref={wrapRef}>
+      <button
+        className={`btn ghost${nDirect || nProxied ? ' soft' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        title={
+          nDirect || nProxied
+            ? `分流规则：跳过代理 ${nDirect} 条 / 强制走代理 ${nProxied} 条`
+            : '设置哪些域名/IP 不经过代理（直连），哪些强制走代理'
+        }
+      >
+        <span>🚦</span>
+        <span className="btn-label">{nDirect || nProxied ? '分流' : '分流规则'}</span>
+        {nDirect || nProxied ? <span>{nDirect}/{nProxied}</span> : null}
+      </button>
+      {open && (
+        <div className="upstream-pop rules-pop">
+          <div className="upstream-pop-title">分流规则（跳过代理 / 走代理）</div>
+          <div className="upstream-pop-desc">
+            每行一条，支持域名、通配符与 IP：
+            <code>example.com</code>（含子域）、<code>*.foo.com</code>、<code>1.2.3.4</code>、
+            <code>192.168.1.*</code>、<code>10.0.0.0/8</code>。规则保存后持久化到
+            <code>~/.miniproxy/config.json</code>，重启后沿用。
+          </div>
+          <div className="rules-field">
+            <label>跳过代理（直连源站，不经上游）</label>
+            <textarea
+              className="rules-textarea"
+              rows={5}
+              spellCheck={false}
+              placeholder={'例如：\n*.company.internal\n192.168.0.0/16\n10.1.2.3'}
+              value={directText}
+              onChange={(e) => setDirectText(e.target.value)}
+            />
+          </div>
+          <div className="rules-field">
+            <label>强制走代理（优先级最高，覆盖上面的直连与内置直连段）</label>
+            <textarea
+              className="rules-textarea"
+              rows={3}
+              spellCheck={false}
+              placeholder={'例如：\n*.githubusercontent.com\n1.2.3.4'}
+              value={proxiedText}
+              onChange={(e) => setProxiedText(e.target.value)}
+            />
+          </div>
+          <label className="rules-check">
+            <input type="checkbox" checked={noMitm} onChange={(e) => setNoMitm(e.target.checked)} />
+            直连的域名不做解密（推荐：内网/自签证书站点不报证书错，但仍会记录为隧道）
+          </label>
+          <div className="upstream-pop-row">
+            <button className="btn primary" disabled={busy} onClick={save}>
+              {busy ? '保存中…' : '保存'}
+            </button>
+            <span className="rules-hint">
+              {st?.systemProxyOn
+                ? `系统代理已开启，保存后同步 bypass（当前 ${st.systemBypass.length} 条）`
+                : '系统代理未开启：规则只作用于 MiniProxy 自身的出站'}
+            </span>
+          </div>
+          {msg && <div className={`upstream-msg ${msg.kind}`}>{msg.text}</div>}
+          <div className="upstream-pop-desc">
+            内置直连（无需配置）：{st?.builtinDirect.join('、')}
+          </div>
         </div>
       )}
     </div>
@@ -280,7 +607,7 @@ function MultiSelect({
       : `${label} · ${selected.length}`;
 
   return (
-    <div className="ms" ref={boxRef} style={{ width }}>
+    <div className="ms" ref={boxRef} style={{ '--ms-w': width ? `${width}px` : undefined } as React.CSSProperties}>
       <button
         type="button"
         className={`ms-btn${selected.length ? ' active' : ''}${open ? ' open' : ''}`}
@@ -694,6 +1021,79 @@ export default function App() {
     setPanelOpen(true);
   }, []);
 
+  /* ---------------- 详情面板宽度：可拖拽分隔条 ---------------- */
+  const mainRef = useRef<HTMLDivElement>(null);
+  const detailPctRef = useRef(0.44);
+  const [detailPct, setDetailPct] = useState(0.44);
+
+  const onSplitDown = useCallback((e: React.PointerEvent) => {
+    const rect = mainRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    e.preventDefault();
+    const move = (ev: PointerEvent) => {
+      const pct = 1 - (ev.clientX - rect.left) / rect.width;
+      detailPctRef.current = Math.min(0.78, Math.max(0.22, pct));
+      setDetailPct(detailPctRef.current);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }, []);
+
+  const onSplitReset = useCallback(() => {
+    detailPctRef.current = 0.44;
+    setDetailPct(0.44);
+  }, []);
+
+  /* ---------------- 窄屏顶栏「☰ 更多」抽屉 ---------------- */
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const menuBtnRef = useRef<HTMLButtonElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  const activeFilterCount =
+    filters.kinds.length +
+    filters.rtypes.length +
+    filters.methods.length +
+    filters.statuses.length +
+    filters.hosts.length +
+    filters.sites.length +
+    filters.apps.length;
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (actionsRef.current?.contains(t) || menuBtnRef.current?.contains(t)) return;
+      setMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [menuOpen]);
+
+  // 窗口变宽（回到桌面布局）时收起抽屉，避免状态残留
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth > 1100) setMenuOpen(false);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
   // 面板打开时按 Esc 收起
   useEffect(() => {
     if (!panelOpen) return;
@@ -714,51 +1114,95 @@ export default function App() {
         </div>
         <span className={`connection-dot ${live ? 'live' : ''}`}>
           <span className="dot" />
-          {live ? '实时连接中' : '未连接'}
+          <span className="dot-text">{live ? '实时连接中' : '未连接'}</span>
         </span>
         <div className="spacer" />
-        {pendingCount > 0 && (
-          <button className="btn primary" onClick={resume}>
-            {pendingCount} 条新记录，点击加载
-          </button>
-        )}
-        <button className={`btn ${paused ? 'active' : ''}`} onClick={() => (paused ? resume() : setPaused(true))}>
-          {paused ? '▶ 恢复' : '⏸ 暂停'}
-        </button>
-        <button className="btn danger" onClick={onClear}>🗑 清空</button>
-        <button className="btn" onClick={openVideos} title="列出抓到的完整视频，点击即可下载">
-          🎬 视频
-        </button>
-        {sysProxy?.supported && (
+        <div className={`header-actions${menuOpen ? ' open' : ''}`} ref={actionsRef}>
+          {pendingCount > 0 && (
+            <button className="btn primary" onClick={resume}>
+              {pendingCount} 条新记录，点击加载
+            </button>
+          )}
           <button
-            className={`btn ${sysProxy.active ? 'primary' : ''}`}
-            disabled={sysBusy}
-            onClick={toggleSysProxy}
-            title={
-              sysProxy.active
-                ? '点击关闭系统代理并恢复直连'
-                : `一键把系统 HTTP/HTTPS 代理指向 127.0.0.1:${sysProxy.port}`
-            }
+            className={`btn ghost${paused ? ' soft' : ''}`}
+            onClick={() => (paused ? resume() : setPaused(true))}
+            title={paused ? '继续接收新记录' : '暂停刷新列表（抓包仍在继续）'}
           >
-            {sysProxy.active ? '🌐 系统代理 已开启' : '🌐 系统代理 已关闭'}
+            <span>{paused ? '▶' : '⏸'}</span>
+            <span className="btn-label">{paused ? '恢复' : '暂停'}</span>
           </button>
-        )}
-        <UpstreamControl />
-        <a className="btn" href={`/api/export?format=json&${exportQuery}`} target="_blank" rel="noreferrer">
-          导出 JSON
-        </a>
-        <a className="btn" href={`/api/export?format=har&${exportQuery}`} target="_blank" rel="noreferrer">
-          导出 HAR
-        </a>
-        <a className="btn" href="/api/ca.crt" download="miniproxy-ca.crt" title="下载 CA 证书并安装到系统/浏览器以解密 HTTPS">
-          🔐 CA 证书
-        </a>
-        <ThemeToggle />
+          <button className="btn ghost danger" onClick={onClear} title="清空当前所有抓包记录">
+            <span>🗑</span>
+            <span className="btn-label">清空</span>
+          </button>
+          <button className="btn ghost" onClick={openVideos} title="列出抓到的完整视频，点击即可下载">
+            <span>🎬</span>
+            <span className="btn-label">视频</span>
+          </button>
+          <span className="header-sep" />
+          {sysProxy?.supported && (
+            <button
+              className={`btn ${sysProxy.active ? 'primary' : 'ghost'}`}
+              disabled={sysBusy}
+              onClick={toggleSysProxy}
+              title={
+                sysProxy.active
+                  ? '点击关闭系统代理并恢复直连'
+                  : `一键把系统 HTTP/HTTPS 代理指向 127.0.0.1:${sysProxy.port}`
+              }
+            >
+              {sysProxy.active ? (
+                <>
+                  <span>🌐</span>
+                  <span className="btn-label">系统代理</span>
+                  <span>已开启</span>
+                </>
+              ) : (
+                <>
+                  <span>🌐</span>
+                  <span className="btn-label">系统代理</span>
+                  <span>已关闭</span>
+                </>
+              )}
+            </button>
+          )}
+          <UpstreamControl />
+          <RulesControl />
+          <BypassControl />
+          <span className="header-sep" />
+          <ExportMenu query={exportQuery} />
+          <ThemeToggle />
+        </div>
+        <button
+          type="button"
+          className="header-menu-btn"
+          ref={menuBtnRef}
+          onClick={() => setMenuOpen((o) => !o)}
+          aria-label="更多操作"
+          aria-expanded={menuOpen}
+          title="更多操作"
+        >
+          ☰
+          {pendingCount > 0 && <span className="menu-badge">{pendingCount}</span>}
+        </button>
       </header>
 
       <div className="toolbar">
         <div className={`search-wrap${qInput ? ' has-value' : ''}`}>
-          <span className="search-icon" aria-hidden="true">🔍</span>
+          <svg
+            className="search-icon"
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+            aria-hidden="true"
+          >
+            <circle cx="11" cy="11" r="7" />
+            <path d="M21 21l-4.5-4.5" />
+          </svg>
           <input
             type="text"
             className="search"
@@ -776,13 +1220,25 @@ export default function App() {
             </button>
           )}
         </div>
-        <MultiSelect
-          label="全部协议"
-          options={kindOptions}
-          selected={filters.kinds}
-          onChange={(v) => setFilters({ ...filters, kinds: v })}
-          width={118}
-        />
+        <button
+          type="button"
+          className={`filters-toggle${filtersOpen ? ' open' : ''}`}
+          onClick={() => setFiltersOpen((o) => !o)}
+          aria-expanded={filtersOpen}
+          title="展开/收起筛选条件"
+        >
+          ⚙ 筛选
+          {activeFilterCount > 0 && <span className="ft-count">{activeFilterCount}</span>}
+          <span className="ms-caret">{filtersOpen ? '▴' : '▾'}</span>
+        </button>
+        <div className={`toolbar-filters${filtersOpen ? ' open' : ''}`}>
+          <MultiSelect
+            label="全部协议"
+            options={kindOptions}
+            selected={filters.kinds}
+            onChange={(v) => setFilters({ ...filters, kinds: v })}
+            width={118}
+          />
         <MultiSelect
           label="全部类型"
           options={typeOptions}
@@ -832,16 +1288,19 @@ export default function App() {
           panelWidth={250}
           searchable
         />
-        <div className="divider" />
-        <span className="tb-label">分组</span>
-        <MultiSelect
-          label="分组方式"
-          options={GROUP_DIMS}
-          selected={[groupBy]}
-          onChange={(v) => setGroupBy((v[0] ?? 'none') as GroupDim)}
-          width={126}
-          single
-        />
+        </div>
+        <div className="toolbar-right">
+          <div className="divider" />
+          <span className="tb-label">分组</span>
+          <MultiSelect
+            label="分组方式"
+            options={GROUP_DIMS}
+            selected={[groupBy]}
+            onChange={(v) => setGroupBy((v[0] ?? 'none') as GroupDim)}
+            width={126}
+            single
+          />
+        </div>
       </div>
 
       {activeChips.length > 0 && (
@@ -960,7 +1419,7 @@ export default function App() {
         </div>
       )}
 
-      <div className={`main${panelOpen ? ' with-detail' : ''}`}>
+      <div className={`main${panelOpen ? ' with-detail' : ''}`} ref={mainRef}>
         <section className="list-pane">
           <div className="list-meta">
             共 {entries.length} 条{hasAnyFilter(filters) ? ' · 已筛选' : ''}
@@ -1016,7 +1475,9 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                    {!isCollapsed && <EntryTable items={items} selectedId={selectedId} onSelect={handleSelect} />}
+                    {!isCollapsed && (
+                      <EntryTable items={items} selectedId={selectedId} onSelect={handleSelect} grouped />
+                    )}
                   </React.Fragment>
                 );
               })
@@ -1027,24 +1488,34 @@ export default function App() {
         </section>
 
         {panelOpen && (
-          <section className="detail-pane">
-            <button
-              type="button"
-              className="detail-close"
-              title="关闭详情面板（Esc）"
-              onClick={() => setPanelOpen(false)}
-            >
-              ×
-            </button>
-            {detail ? (
-              <Detail detail={detail} tab={tab} setTab={setTab} />
-            ) : (
-              <div className="empty-state">
-                <div style={{ fontSize: 28 }}>⏳</div>
-                <div>正在加载详情…</div>
-              </div>
-            )}
-          </section>
+          <>
+            <div
+              className="splitter"
+              onPointerDown={onSplitDown}
+              onDoubleClick={onSplitReset}
+              title="拖动调整宽度，双击恢复默认"
+              role="separator"
+              aria-orientation="vertical"
+            />
+            <section className="detail-pane" style={{ flex: `0 0 ${(detailPct * 100).toFixed(2)}%` }}>
+              <button
+                type="button"
+                className="detail-close"
+                title="关闭详情面板（Esc）"
+                onClick={() => setPanelOpen(false)}
+              >
+                ×
+              </button>
+              {detail ? (
+                <Detail detail={detail} tab={tab} setTab={setTab} />
+              ) : (
+                <div className="empty-state">
+                  <div style={{ fontSize: 28 }}>⏳</div>
+                  <div>正在加载详情…</div>
+                </div>
+              )}
+            </section>
+          </>
         )}
       </div>
 
@@ -1147,22 +1618,82 @@ export default function App() {
 }
 
 /* ---------------- 列表表格 ---------------- */
+/* 单行 memo：SSE 持续追加记录时，只有变化的那几行会重渲染 */
+const EntryRow = React.memo(function EntryRow({
+  e,
+  selected,
+  onSelect,
+}: {
+  e: EntrySummary;
+  selected: boolean;
+  onSelect: (id: number) => void;
+}) {
+  return (
+    <tr className={`row ${selected ? 'selected' : ''}`} onClick={() => onSelect(e.id)}>
+      <td><MethodBadge method={e.kind === 'http' ? e.method : e.kind === 'ws' ? 'WS' : 'TUNNEL'} /></td>
+      <td className={`status-cell ${statusColor(e.status)}`}>{statusText(e)}</td>
+      <td className="url-cell" title={e.url}>
+        <span
+          className={`type-tag tt-${e.resourceType}`}
+          title={`类型：${resourceMeta(e.resourceType).label}${e.contentType ? `\nContent-Type: ${e.contentType}` : ''}`}
+        >
+          {resourceMeta(e.resourceType).short}
+        </span>
+        {e.url.replace(/^https?:\/\//, '')}
+        {e.encoding && <span className="encoding-tag">{e.encoding}</span>}
+        {e.qInContent && (
+          <span className="badge hit" title="关键词命中请求/响应内容（URL 未命中）">
+            内容匹配
+          </span>
+        )}
+        {e.error && <span className="badge err" title={e.error}>!</span>}
+      </td>
+      <td
+        className="size-cell"
+        title={`请求体: ${formatBytes(e.reqSize)} · 响应体: ${formatBytes(e.respSize || e.bytesDown)}\n网络流量: ↑ ${formatBytes(e.bytesUp)} / ↓ ${formatBytes(e.bytesDown)}`}
+      >
+        {e.kind === 'tcp' ? (
+          <>↑{formatBytes(e.bytesUp)} ↓{formatBytes(e.bytesDown)}</>
+        ) : (
+          <>
+            <span className="size-up">↑{formatBytes(e.reqSize)}</span>{' '}
+            <span className="size-down">↓{formatBytes(e.respSize || e.bytesDown)}</span>
+          </>
+        )}
+      </td>
+      <td
+        className={`dur-cell ${e.durationMs >= 3000 ? 'dur-very-slow' : e.durationMs >= 800 ? 'dur-slow' : ''}`}
+        title={`耗时 ${formatMs(e.durationMs)}${
+          e.kind === 'tcp' || e.kind === 'ws' ? '（连接存续时长）' : ''
+        }`}
+      >
+        {e.done || e.kind === 'http' ? formatMs(e.durationMs) : '···'}
+      </td>
+      <td>{formatTime(e.ts)}</td>
+    </tr>
+  );
+});
+
 function EntryTable({
   items,
   selectedId,
   onSelect,
+  grouped = false,
 }: {
   items: EntrySummary[];
   selectedId: number | null;
   onSelect: (id: number) => void;
+  /** 处于分组列表中：列头吸顶要下移，给分组标题让位 */
+  grouped?: boolean;
 }) {
   return (
-    <table className="entries">
+    <table className={`entries${grouped ? ' grouped' : ''}`}>
       <colgroup>
         <col className="col-method" />
         <col className="col-status" />
         <col />
         <col className="col-size" />
+        <col className="col-dur" />
         <col className="col-time" />
       </colgroup>
       <thead>
@@ -1171,49 +1702,18 @@ function EntryTable({
           <th>状态</th>
           <th>URL</th>
           <th title="↑ 请求体大小 · ↓ 响应体大小">大小</th>
+          <th title="从收到请求到响应体读完的耗时">耗时</th>
           <th>时间</th>
         </tr>
       </thead>
       <tbody>
         {items.map((e) => (
-          <tr
+          <EntryRow
             key={`${e.id}-${e.wsMessages}-${e.done}`}
-            className={`row ${selectedId === e.id ? 'selected' : ''}`}
-            onClick={() => onSelect(e.id)}
-          >
-            <td><MethodBadge method={e.kind === 'http' ? e.method : e.kind === 'ws' ? 'WS' : 'TUNNEL'} /></td>
-            <td className={`status-cell ${statusColor(e.status)}`}>{statusText(e)}</td>
-            <td className="url-cell" title={e.url}>
-              <span
-                className={`type-tag tt-${e.resourceType}`}
-                title={`类型：${resourceMeta(e.resourceType).label}${e.contentType ? `\nContent-Type: ${e.contentType}` : ''}`}
-              >
-                {resourceMeta(e.resourceType).short}
-              </span>
-              {e.url.replace(/^https?:\/\//, '')}
-              {e.encoding && <span className="encoding-tag">{e.encoding}</span>}
-              {e.qInContent && (
-                <span className="badge hit" title="关键词命中请求/响应内容（URL 未命中）">
-                  内容匹配
-                </span>
-              )}
-              {e.error && <span className="badge err" title={e.error}>!</span>}
-            </td>
-            <td
-              className="size-cell"
-              title={`请求体: ${formatBytes(e.reqSize)} · 响应体: ${formatBytes(e.respSize || e.bytesDown)}\n网络流量: ↑ ${formatBytes(e.bytesUp)} / ↓ ${formatBytes(e.bytesDown)}`}
-            >
-              {e.kind === 'tcp' ? (
-                <>↑{formatBytes(e.bytesUp)} ↓{formatBytes(e.bytesDown)}</>
-              ) : (
-                <>
-                  <span className="size-up">↑{formatBytes(e.reqSize)}</span>{' '}
-                  <span className="size-down">↓{formatBytes(e.respSize || e.bytesDown)}</span>
-                </>
-              )}
-            </td>
-            <td>{formatTime(e.ts)}</td>
-          </tr>
+            e={e}
+            selected={selectedId === e.id}
+            onSelect={onSelect}
+          />
         ))}
       </tbody>
     </table>
@@ -1601,6 +2101,7 @@ function Detail({
       <div className="detail-head">
         <div className="url">
           {kind === 'http' && <MethodBadge method={detail.method} />} {detail.url}
+          <CopyButton text={detail.url} label="⧉ 复制 URL" title="复制完整 URL" />
         </div>
         <div className="meta">
           {detail.status != null && (
@@ -1609,6 +2110,9 @@ function Detail({
           {detail.contentType && <span>类型 <b>{detail.contentType.split(';')[0]}</b></span>}
           {detail.decoded && <span className="badge decode">已解压 {detail.decoded}</span>}
           <span>↑ {formatBytes(detail.bytesUp)} / ↓ {formatBytes(detail.bytesDown)}</span>
+          <span title="从收到请求到响应体读完的耗时">
+            耗时 <b>{formatMs(detail.durationMs)}</b>
+          </span>
           <span>ID #{detail.id}</span>
           {detail.error && <span className="badge err">{detail.error}</span>}
         </div>

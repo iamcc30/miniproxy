@@ -23,6 +23,8 @@ export interface EntrySummary {
   wsClosed: boolean;
   done: boolean;
   error: string | null;
+  /** 从收到请求到响应体读完的耗时（毫秒）；未结束的条目为「到现在为止」 */
+  durationMs: number;
   /** 对端 IP（识别局域网设备，如手机抓包） */
   clientIp?: string;
   /** 关键词仅命中请求/响应内容时由服务端置位（用于列表标注「内容匹配」） */
@@ -401,6 +403,73 @@ export async function scanUpstream(): Promise<{ ok: boolean; candidates: Upstrea
   return r.json();
 }
 
+/* ---------------- 自动直通名单 ---------------- */
+
+export interface BypassItem {
+  host: string;
+  count: number;
+  /** client = 客户端拒绝 MITM 证书；outbound = 对端 TLS 不兼容（只提供旧式套件） */
+  reason: 'client' | 'outbound';
+}
+
+export async function fetchBypass(): Promise<{
+  items: BypassItem[];
+  threshold: number;
+  outboundThreshold: number;
+}> {
+  const r = await fetch('/api/bypass');
+  return r.json();
+}
+
+/** 清空自动直通名单：此后所有域名重新尝试 MITM 解密 */
+export async function clearBypass(): Promise<{ ok: boolean; cleared: number }> {
+  const r = await fetch('/api/bypass/clear', { method: 'POST' });
+  return r.json();
+}
+
+/* ---------------- 分流规则（跳过代理 / 强制走代理） ---------------- */
+
+export interface RulesState {
+  /** 跳过代理、直连源站的域名/IP */
+  direct: string[];
+  /** 强制走上游代理的域名/IP（优先级最高） */
+  proxied: string[];
+  /** 直连域名是否同时跳过 MITM 解密 */
+  directNoMitm: boolean;
+  /** 系统代理当前是否已开启（开启时规则会同步进系统 bypass 列表） */
+  systemProxyOn: boolean;
+  /** 实际写入系统代理 bypass 的条目 */
+  systemBypass: string[];
+  /** 内置直连段说明 */
+  builtinDirect: string[];
+}
+
+export interface RulesSaveResult {
+  ok: boolean;
+  error?: string;
+  warning?: string | null;
+  directCount?: number;
+  systemProxyOn?: boolean;
+}
+
+export async function fetchRules(): Promise<RulesState> {
+  const r = await fetch('/api/rules');
+  return r.json();
+}
+
+export async function saveRules(body: {
+  direct: string[];
+  proxied: string[];
+  directNoMitm: boolean;
+}): Promise<RulesSaveResult> {
+  const r = await fetch('/api/rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
 export function upstreamSourceLabel(source?: string): string {
   switch (source) {
     case 'env':
@@ -422,6 +491,13 @@ export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+/** 耗时展示：<1s 用毫秒，≥1s 用秒（保留两位）。 */
+export function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
 }
 
 export function formatTime(ts: number): string {
