@@ -36,18 +36,69 @@ miniproxy/
 │       ├── rules.rs    # 出站分流规则：跳过代理/强制走代理（通配符 + CIDR 匹配）
 │       ├── dial.rs     # 出站拨号：直连 / 上游 CONNECT 级联 / 本机代理自动探测
 │       └── util.rs     # 通用工具
-└── frontend/           # React + Vite + TypeScript
-    └── src/            # App.tsx（列表/过滤/详情）、api.ts、theme.ts、styles.css
+├── frontend/           # React + Vite + TypeScript
+│   └── src/            # App.tsx（列表/过滤/详情）、api.ts、theme.ts、styles.css
+└── packaging/          # 打包成 macOS .app
+    ├── package-macos.sh
+    ├── shell/AppShell.m  # 原生外壳：NSWindow + WKWebView，双击即出窗口
+    ├── make-icon.py    # 生成 AppIcon.png（纯 Pillow 绘制）
+    └── AppIcon.png
 ```
+
+## 打包成 macOS 应用
+
+```bash
+packaging/package-macos.sh            # 产物：dist/MiniProxy.app（约 107MB）
+packaging/package-macos.sh --no-ffmpeg   # 不内置 ffmpeg（省 100MB，音视频合并回退为分开下载）
+```
+
+脚本会：构建前端 → `cargo build --release` → 组装 Bundle → 编译原生外壳 → 生成图标 → ad-hoc 签名。
+装进应用程序目录后**双击图标直接出窗口**（原生 NSWindow + WKWebView，不经过浏览器；
+重复双击只会把已有窗口带到前台）：
+
+```bash
+cp -R dist/MiniProxy.app /Applications/
+open /Applications/MiniProxy.app
+```
+
+Bundle 结构与要点：
+
+| 内容 | 说明 |
+|---|---|
+| `Contents/MacOS/MiniProxy` | 原生外壳（`packaging/shell/AppShell.m`，系统 clang 编译，零额外依赖）：拉起/收养后端、窗口里加载界面、Cmd+Q 优雅退出 |
+| `Contents/MacOS/miniproxy-bin` | release 二进制 |
+| `Contents/Resources/static/` | 前端产物。`static_dir()` 会**按可执行文件相对路径**找它（`api.rs`），Finder 双击时工作目录是 `/`，CWD 相对路径全部失效 |
+| `Contents/Resources/bin/ffmpeg|ffprobe` | arm64 静态构建（osxexperts.net），`find_ffmpeg()` 优先用它，其次 Homebrew/PATH |
+| `Contents/Resources/AppIcon.icns` | 由 `packaging/make-icon.py` 生成 |
+
+外壳行为：
+
+- 启动时若 9000 已有 MiniProxy（比如上次强杀剩下的无头后端），直接**收养**并显示它的界面，不再起子进程；
+- **退出**：Cmd+Q、关闭窗口、Dock 退出、`kill` 外壳，都会先 `POST /api/quit` 让后端优雅停机
+  （恢复系统代理、收尾在途请求），等子进程退出后外壳才退；后端先没了（界面里点「⏻ 退出」）外壳也跟着退，不留僵尸窗口；
+- 菜单栏有「在浏览器打开界面 ⌘B」，需要大屏调试时可再开一份网页版。
+
+注意：
+
+- **签名/分发**：默认 ad-hoc（`MINIPROXY_SIGN_ID=-`）本地自用；要发给别人需
+  `MINIPROXY_SIGN_ID="Developer ID Application: …" codesign …` + notarytool 公证，否则对方会被 Gatekeeper 拦。
+- **CA 信任仍要手动**（App 化解决不了提权问题）：
+  `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.miniproxy/ca.crt`
+- 静态文件服务会拒绝带 `..` 的路径段（`GET /../../../etc/passwd` → 404）。
+- 卸载：`rm -rf /Applications/MiniProxy.app`；配置与 CA 在 `~/.miniproxy/`，想清干净一并删除。
 
 ## 快速开始
 
-### 1. 启动后端
+### 1. 启动 MiniProxy（web 服务 + 代理服务）
 
 ```bash
 cd backend
 cargo run            # 默认代理端口 34567，界面端口 9000
 ```
+
+这一步只让**两个服务开始监听**：web 服务（界面 + API，`127.0.0.1:9000`）与代理服务
+（抓包口 `0.0.0.0:34567`）。它**不会改动系统代理**——把系统流量交给 MiniProxy 是另一个
+动作，需要你手动触发，见「4. 开始抓包」里的「开启系统代理」。
 
 可用环境变量：
 - `MINIPROXY_PORT`（默认 34567）：代理监听端口
@@ -179,7 +230,7 @@ MINIPROXY_NO_MITM=pinning.example.com,other.example.org cargo run
 - 关键词在服务端匹配（`GET /api/entries?q=...`），前端 250ms 防抖；搜索期间新到记录若 URL 未命中，会防抖重查由服务端确认正文；
 - 每条记录的检索索引按需构建并缓存（内容变化自动重建），单侧正文参与搜索的上限 128KB，非 UTF-8 二进制（图片/字体等）自动跳过。
 
-### 3. 构建前端（首次）
+### 2. 构建前端（首次）
 
 ```bash
 cd frontend
@@ -188,7 +239,7 @@ npm install && npm run build
 
 构建产物默认从 `./static` 或 `./frontend/dist` 提供。
 
-### 4. 信任 CA 证书（解密 HTTPS 必需）
+### 3. 信任 CA 证书（解密 HTTPS 必需）
 
 首次启动后，CA 证书位于 `~/.miniproxy/ca.crt`，也可在界面右上角点击「CA 证书」下载。
 
@@ -207,7 +258,10 @@ sudo security add-trusted-cert -d -r trustRoot \
 > 验证是否修好：`openssl verify -CAfile ~/.miniproxy/ca.crt <某条抓包导出的叶子证书>` 应输出 OK；或直接
 > `curl --cacert ~/.miniproxy/ca.crt -x http://127.0.0.1:34567 https://www.bing.com/` 能拿到状态码。
 
-### 5. 开始抓包
+### 4. 开始抓包
+
+> **先分清两件事**：「启动服务」（第 1 步）只是让 web 服务与代理服务开始监听；
+> 「开启系统代理」（本节第一条）才把系统流量交给 MiniProxy。前者自动，后者手动。
 
 - **一键系统代理（推荐）**：打开界面 http://127.0.0.1:9000，点击右上角「🌐 系统代理」即可将系统 HTTP/HTTPS 代理指向 MiniProxy；再次点击恢复原状（自动备份/还原原有代理配置）
 - **退出自动恢复**：开启系统代理后，无论程序是 Ctrl+C 正常退出、被 `kill` 强杀还是崩溃，
@@ -227,7 +281,7 @@ sudo security add-trusted-cert -d -r trustRoot \
   并在设备上安装信任 CA 证书（见下节）；界面检测到局域网设备接入时会自动弹出安装引导（含证书下载二维码）
 - 手机抓包需让 API 对局域网开放以供下载证书：`MINIPROXY_API_HOST=0.0.0.0 cargo run`
 
-### 6. 手机抓包（TLS 握手失败排查）
+### 5. 手机抓包（TLS 握手失败排查）
 
 手机上所有请求报「TLS 握手失败（客户端拒绝 MITM 证书或提前断开）」，
 原因是**设备尚未安装信任 MiniProxy CA 证书**——代理本身连通正常（否则连记录都不会有）：
@@ -253,7 +307,7 @@ sudo security add-trusted-cert -d -r trustRoot \
 
 打开界面：**http://127.0.0.1:9000**
 
-### 7. 抓不到某个 App 的包？（不使用 macOS 系统代理的客户端）
+### 6. 抓不到某个 App 的包？（不使用 macOS 系统代理的客户端）
 
 界面里的「系统代理」只对**走系统网络栈**的客户端生效——浏览器（Chromium/WebKit）、
 微信/企业微信、`curl`、Electron 应用等；而自带 HTTP 栈、不读 macOS 系统代理配置的程序**看不见**：

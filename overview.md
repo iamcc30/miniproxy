@@ -15,7 +15,7 @@
 
 ## 文件结构
 
-- `backend/` — Rust 后端（hyper + rustls + rcgen），`cargo run` 即可启动
+- `backend/` — Rust 后端（hyper + rustls + rcgen）；`cargo run` 同时启动 **web 服务**（界面 + API，`127.0.0.1:9000`）与 **代理服务**（抓包口 `0.0.0.0:34567`）。两者只是"开始监听"，**不会改动系统代理**
 - `frontend/` — React + Vite + TS，`npm run build` 后由后端托管
 - `README.md` — 使用说明（代理配置、CA 信任、环境变量）
 
@@ -99,5 +99,9 @@ TTL `OUTBOUND_BYPASS_TTL_MS = 30min`，过期重试 MITM 以免上游偶发掉�
 
 - HTTPS 解密需信任 CA：`~/.miniproxy/ca.crt`（界面右上角可下载）
 - 默认端口：代理 34567、界面 9000（可用 `MINIPROXY_PORT` / `MINIPROXY_API_PORT` 调整）
+- 术语：「**启动服务**」= 启动 web 服务（:9000）+ 代理服务（:34567），随进程启动自动完成；
+  「**开启系统代理**」= 把系统流量指向 :34567，只在点击界面右上角按钮时发生（`POST /api/system-proxy/enable`
+  是全代码唯一的开启入口）。**启动服务不会开启系统代理**；反向只有一种情况：启动自检发现上次
+  残留的备份且系统代理仍指向已停端口时，会按备份**恢复原值**（只会关，不会开）。
 - 已知限制：正文单条最多存 4MB（搜索索引单侧 128KB）；permessage-deflate WS 压缩帧不解压；应用归因仅对本机发起的连接有效
 - 新环境变量：`MINIPROXY_DIAL_TIMEOUT_MS`（出站超时，默认 10000）、`MINIPROXY_NO_H2=1`（关闭 h2）
