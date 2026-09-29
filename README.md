@@ -1,6 +1,13 @@
 # MiniProxy 抓包代理工具
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-000000?logo=rust&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+
 基于 **Rust（后端）+ React（前端）** 的 HTTP/HTTPS/WebSocket/TCP 抓包调试代理，支持 MITM 解密、内容解压、按域名分组筛选、实时可视化与 JSON/HAR 导出。
+
+本地运行的开源抓包工具：所有流量、证书与记录都留在你自己的机器上（配置写入 `~/.miniproxy/`），无需注册账号，也不上传任何数据。
 
 ## 功能特性
 
@@ -357,3 +364,20 @@ sudo security add-trusted-cert -d -r trustRoot \
 - 「按应用」分组通过 `lsof` 识别**本机客户端进程**（约 60ms/连接，已缓存；`MINIPROXY_NO_APP=1` 可关闭）。经远程机器转发进来的流量无法识别原始进程，会显示为「未知应用」。
 - HTTP/2 上游以 HTTP/1.1 对接（ALPN 不向上游协商 h2），绝大多数站点兼容。
 - HTTP/1.1 Keep-Alive 多路复用场景下，一条 UI 记录对应一次「请求-响应」往返。
+
+## 常见用途
+
+- 排查某个 App「网络错误」到底是超时、证书问题还是服务端 5xx
+- 抓 WebSocket 逐帧消息，还原聊天 / 流式接口的真实交互
+- 对比同一接口在开启 / 关闭上游代理时的耗时差异，定位是节点问题还是源站问题
+- 导出 HAR 丢进浏览器 DevTools 或 Charles 复现问题
+
+## 许可证
+
+本项目基于 [MIT License](./LICENSE) 开源，可自由使用、修改、分发与商用，只需保留版权声明与许可声明。
+
+## 免责声明
+
+MiniProxy 通过本地 CA 做 TLS 中间人解密，**仅可用于你拥有或已获得明确授权的流量调试**。
+请勿用于窃听他人通信或任何违法用途，使用者需自行承担因使用本工具产生的一切后果。
+
