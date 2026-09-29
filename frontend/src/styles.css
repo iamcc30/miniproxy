@@ -65,6 +65,26 @@
 
 * { box-sizing: border-box; }
 
+/* ============ 图标（src/icons.tsx 的内联 SVG） ============ */
+/* 尺寸默认 1em（跟着所在元素字号走），描边用 currentColor 跟随文字色，
+   所以深浅主题、按钮的 primary/danger 态都不需要单独适配。 */
+.icon {
+  flex: none;
+  display: inline-block;
+  vertical-align: -0.14em;
+  overflow: visible;
+}
+/* 内联上下文（如 .lan-hint 里的省略号）需要图标不打断文字排版 */
+.icon-spin { animation: icon-spin 0.9s linear infinite; }
+@keyframes icon-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-spin { animation-duration: 2.4s; }
+}
+/* 空态里的大图标：别太抢眼 */
+.empty-icon { opacity: 0.5; }
+
 html, body, #root { height: 100%; }
 
 body {
@@ -93,7 +113,7 @@ input, select {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
   row-gap: 4px;
   padding: 0 var(--space-4);
   background: var(--bg-secondary);
@@ -108,7 +128,7 @@ input, select {
   color: #fff; font-size: 13px; font-weight: 800;
 }
 .brand .sub { font-size: var(--text-xs); color: var(--text-muted); font-weight: 400; white-space: nowrap; }
-@media (max-width: 1500px) { .brand .sub { display: none; } }
+@media (max-width: 1600px) { .brand .sub { display: none; } }
 
 .header .spacer { flex: 1; }
 
@@ -164,7 +184,31 @@ input, select {
 /* 顶栏竖分隔线 */
 .header-sep { flex: none; width: 1px; height: 22px; background: var(--border-color); margin: 0 2px; }
 
-/* 窄屏「☰ 更多」抽屉：宽屏下隐藏按钮、actions 直接参与 header 的 flex 布局 */
+/* 顶栏按钮分组：相关按钮收进同一个圆角描边容器，内部用细竖线分隔 */
+.btn-group {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}
+.btn-group .btn { border-radius: 0; padding: 6px 10px; }
+.btn-group > *:first-child,
+.btn-group > *:first-child .btn { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.btn-group > *:last-child,
+.btn-group > *:last-child .btn { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.btn-group > * { position: relative; }
+.btn-group > * + *::before {
+  content: '';
+  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 14px; background: var(--border-color);
+}
+/* 分组内的主题切换：脱掉自己的描边胶囊，退化成组内的三段图标 */
+.btn-group > .theme-toggle {
+  border: none; background: transparent; border-radius: 0;
+  padding: 0 3px;
+}
+.btn-group > .theme-toggle button { border-radius: var(--radius-sm); padding: 5px 6px; }
+
+/* 窄屏「更多」抽屉：宽屏下隐藏菜单按钮、actions 直接参与 header 的 flex 布局 */
 .header-actions { display: contents; }
 .header-menu-btn {
   display: none;
@@ -197,6 +241,7 @@ input, select {
   padding: 3px;
 }
 .theme-toggle button {
+  display: inline-flex; align-items: center; justify-content: center;
   border: none; background: transparent;
   padding: 4px 10px; border-radius: 16px;
   font-size: var(--text-xs); color: var(--text-secondary);
@@ -226,6 +271,18 @@ input, select {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent);
 }
 .toolbar .search { width: 260px; }
+/* 搜索框：胶囊形，默认无边框只留底色，聚焦时才浮出主色描边 */
+.toolbar input.search {
+  border-radius: 999px;
+  border-color: transparent;
+  background: var(--bg-tertiary);
+}
+.toolbar input.search:hover { border-color: var(--border-color); }
+.toolbar input.search:focus {
+  background: var(--bg-secondary);
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 14%, transparent);
+}
 /* 「分组」下拉靠右，与左侧筛选隔开 */
 .toolbar-right { display: flex; align-items: center; gap: var(--space-2); margin-left: auto; }
 .search-wrap { position: relative; display: inline-flex; align-items: center; flex: none; }
@@ -259,6 +316,35 @@ input, select {
 .ms-btn:hover { border-color: var(--text-muted); }
 .ms-btn.active { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 55%, var(--border-color)); background: color-mix(in srgb, var(--primary) 10%, var(--bg-tertiary)); }
 .ms-btn.open { border-color: var(--primary); }
+/* 筛选条：7 个下拉共用一个圆角描边容器，内部细竖线分隔，按钮本身退成幽灵态 */
+.filter-bar {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}
+.filter-bar > * { position: relative; }
+.filter-bar > * + *::before {
+  content: '';
+  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 14px; background: var(--border-color);
+}
+.filter-bar .ms-btn { border: none; background: transparent; color: var(--text-secondary); }
+.filter-bar .ms-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.filter-bar .ms-btn.active {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+.filter-bar .ms-btn.open {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+}
+.filter-bar > .ms:first-child .ms-btn { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.filter-bar > .ms:last-child .ms-btn { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+/* 右侧「分组」下拉同样退成幽灵态，与筛选条呼应 */
+.toolbar-right .ms-btn { border-color: transparent; background: transparent; }
+.toolbar-right .ms-btn:hover { border-color: transparent; background: var(--bg-tertiary); color: var(--text-primary); }
+.toolbar-right .ms-btn.active { border-color: transparent; background: color-mix(in srgb, var(--primary) 12%, transparent); }
+.toolbar-right .ms-btn.open { border-color: transparent; background: color-mix(in srgb, var(--primary) 16%, transparent); }
 .ms-text { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ms-caret { flex: none; font-size: 10px; opacity: 0.7; }
 .ms-panel {
@@ -320,6 +406,7 @@ button.ms-item:hover { background: var(--bg-tertiary); }
 .chip-group { color: var(--text-muted); }
 .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
 .chip-x {
+  display: inline-flex; align-items: center;
   border: none; background: none; cursor: pointer; line-height: 1;
   color: var(--text-muted); font-size: 14px; padding: 0 3px; border-radius: 50%;
 }
@@ -404,6 +491,7 @@ button.ms-item:hover { background: var(--bg-tertiary); }
 }
 /* 「只看此组」——把分组维度写进筛选条件 */
 .group-header .gh-filter {
+  display: inline-flex; align-items: center; gap: 3px;
   flex: none; cursor: pointer; white-space: nowrap;
   font-size: 10px; font-weight: 500; line-height: 1.6;
   padding: 0 8px; border-radius: 999px;
@@ -655,6 +743,7 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .lan-help-btn {
+  display: inline-flex; align-items: center; gap: 4px;
   flex: none; cursor: pointer; white-space: nowrap;
   font-size: var(--text-sm); font-weight: 500;
   padding: 4px 12px; border-radius: 999px;
@@ -696,6 +785,7 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
 }
 .lan-qr span { font-size: 11px; color: #333; }
 .lan-close {
+  display: inline-flex; align-items: center; justify-content: center;
   flex: none; width: 22px; height: 22px; line-height: 1;
   border: none; border-radius: 50%; background: transparent;
   color: var(--text-muted); font-size: 16px; cursor: pointer;
@@ -708,6 +798,7 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
 .ws-toolbar .mini-copy { margin-left: auto; }
 /* 小号复制按钮（WS 消息工具条 / 单条消息头） */
 .mini-copy {
+  display: inline-flex; align-items: center; gap: 4px;
   border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-secondary);
   font-size: var(--text-xs); padding: 2px 8px; border-radius: var(--radius-sm);
   cursor: pointer; font-family: inherit; flex: none; white-space: nowrap;
@@ -792,7 +883,8 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
 /* ---- 顶栏「导出」下拉 ---- */
 .export-pop { width: 200px; padding: 6px; gap: 2px; }
 .export-item {
-  display: block; padding: 7px 10px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: var(--radius-sm);
   color: var(--text-primary); text-decoration: none;
   font-size: var(--text-sm); white-space: nowrap;
   transition: background 0.12s ease, color 0.12s ease;
@@ -926,12 +1018,22 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
     box-shadow: 0 14px 36px rgba(0, 0, 0, 0.3);
   }
   .header-actions.open > .btn { width: 100%; justify-content: flex-start; }
+  /* 抽屉内分组容器摊平：去掉描边和内部竖线，按钮逐个铺满 */
+  .header-actions.open .btn-group {
+    display: flex; flex-direction: column; align-items: stretch;
+    border: none; border-radius: 0; gap: 6px;
+  }
+  .header-actions.open .btn-group .btn,
+  .header-actions.open .btn-group > * { width: 100%; border-radius: var(--radius-sm); }
+  .header-actions.open .btn-group > * + *::before { display: none; }
+  /* 抽屉内主题切换不再占满整行，三个分段靠左并排即可 */
+  .header-actions.open .btn-group > .theme-toggle { width: auto; align-self: flex-start; }
   /* 抽屉内按钮必须带文字（覆盖中等宽度的图标模式） */
   .header-actions.open .btn-label { display: inline; }
   .header-actions.open .upstream-wrap { width: 100%; }
   .header-actions.open .upstream-wrap > .btn { width: 100%; justify-content: flex-start; }
   .header-actions.open .header-sep { width: 100%; height: 1px; margin: 4px 0; }
-  .header-actions.open > .theme-toggle { align-self: flex-start; }
+
   /* 抽屉内的浮层脱离 overflow 裁剪，铺满可用宽度 */
   .header-actions.open .upstream-pop {
     position: fixed; left: 8px; right: 8px;
@@ -960,8 +1062,12 @@ pre.body-view.hex-view { white-space: pre; overflow-x: auto; word-break: normal;
   .toolbar-filters.open {
     display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 100%; padding-top: 2px;
   }
-  .toolbar-filters.open .ms { width: auto; flex: 1 1 calc(50% - 3px); }
-  .toolbar-filters.open .ms-btn { width: 100%; }
+  .toolbar-filters.open .filter-bar {
+    flex: 1 1 100%; flex-wrap: wrap; gap: 6px;
+  }
+  .toolbar-filters.open .filter-bar > * + *::before { display: none; }
+  .toolbar-filters.open .filter-bar .ms { width: auto; flex: 1 1 calc(50% - 3px); }
+  .toolbar-filters.open .filter-bar .ms-btn { width: 100%; border-radius: var(--radius-sm); }
   .toolbar-right { flex: 1 1 calc(50% - 3px); margin-left: 0; }
   .toolbar-right .divider { display: none; }
   .toolbar-right .ms { width: auto; flex: 1 1 auto; }

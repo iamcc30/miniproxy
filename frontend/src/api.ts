@@ -347,6 +347,12 @@ export async function setSysProxy(enable: boolean): Promise<SysProxyStatus> {
   return r.json();
 }
 
+/** 请求后端优雅退出（恢复系统代理后结束进程）。打包成 App 后这是唯一的正常退出入口。 */
+export async function quitApp(): Promise<{ ok?: boolean; hint?: string }> {
+  const r = await fetch('/api/quit', { method: 'POST' });
+  return r.json();
+}
+
 /* ---------------- 上游级联 ---------------- */
 
 export interface UpstreamStatus {

@@ -54,6 +54,7 @@ import {
   resourceMeta,
   scanUpstream,
   setSysProxy,
+  quitApp,
   setUpstream,
   statusColor,
   stitchEntryBody,
@@ -65,6 +66,39 @@ import {
 } from './api';
 import { QRCodeSVG } from 'qrcode.react';
 import { applyTheme, getStoredTheme, watchSystemTheme, Theme } from './theme';
+import {
+  IconAlertTriangle,
+  IconArchive,
+  IconBraces,
+  IconCheck,
+  IconChevronDown,
+  IconChevronRight,
+  IconChevronUp,
+  IconClapperboard,
+  IconCopy,
+  IconDownload,
+  IconGlobe,
+  IconKey,
+  IconLink,
+  IconMenu,
+  IconMonitor,
+  IconMoon,
+  IconPause,
+  IconPlay,
+  IconPower,
+  IconRadar,
+  IconRefresh,
+  IconRoute,
+  IconSearch,
+  IconShield,
+  IconSliders,
+  IconSmartphone,
+  IconSpinner,
+  IconSun,
+  IconTrash,
+  IconWifi,
+  IconX,
+} from './icons';
 
 /* ---------------- 主题切换 ---------------- */
 function ThemeToggle() {
@@ -76,9 +110,30 @@ function ThemeToggle() {
   };
   return (
     <div className="theme-toggle" role="radiogroup" aria-label="主题选择">
-      <button className={theme === 'light' ? 'active' : ''} onClick={() => pick('light')} title="浅色">☀️</button>
-      <button className={theme === 'dark' ? 'active' : ''} onClick={() => pick('dark')} title="深色">🌙</button>
-      <button className={theme === 'system' ? 'active' : ''} onClick={() => pick('system')} title="跟随系统">💻</button>
+      <button
+        className={theme === 'light' ? 'active' : ''}
+        onClick={() => pick('light')}
+        title="浅色"
+        aria-label="浅色"
+      >
+        <IconSun size={14} />
+      </button>
+      <button
+        className={theme === 'dark' ? 'active' : ''}
+        onClick={() => pick('dark')}
+        title="深色"
+        aria-label="深色"
+      >
+        <IconMoon size={14} />
+      </button>
+      <button
+        className={theme === 'system' ? 'active' : ''}
+        onClick={() => pick('system')}
+        title="跟随系统"
+        aria-label="跟随系统"
+      >
+        <IconMonitor size={14} />
+      </button>
     </div>
   );
 }
@@ -105,9 +160,9 @@ function ExportMenu({ query }: { query: string }) {
         aria-expanded={open}
         title="导出抓包内容 / 下载 CA 证书"
       >
-        <span>⬇</span>
+        <IconDownload />
         <span className="btn-label">导出</span>
-        <span className="ms-caret">▾</span>
+        <span className="ms-caret"><IconChevronDown size={10} /></span>
       </button>
       {open && (
         <div className="upstream-pop export-pop" role="menu">
@@ -119,6 +174,7 @@ function ExportMenu({ query }: { query: string }) {
             rel="noreferrer"
             onClick={() => setOpen(false)}
           >
+            <IconBraces />
             导出 JSON
           </a>
           <a
@@ -129,6 +185,7 @@ function ExportMenu({ query }: { query: string }) {
             rel="noreferrer"
             onClick={() => setOpen(false)}
           >
+            <IconArchive />
             导出 HAR（含正文）
           </a>
           <div className="export-sep" />
@@ -140,7 +197,8 @@ function ExportMenu({ query }: { query: string }) {
             title="安装到系统/浏览器以解密 HTTPS"
             onClick={() => setOpen(false)}
           >
-            🔐 下载 CA 证书
+            <IconKey />
+            下载 CA 证书
           </a>
         </div>
       )}
@@ -236,13 +294,13 @@ function UpstreamControl() {
       >
         {enabled ? (
           <>
-            <span>🔗</span>
+            <IconLink />
             <span className="btn-label">上游</span>
             <span>{st?.addr}</span>
           </>
         ) : (
           <>
-            <span>🔗</span>
+            <IconLink />
             <span className="btn-label">上游级联</span>
           </>
         )}
@@ -256,7 +314,17 @@ function UpstreamControl() {
           </div>
           <div className="upstream-pop-row">
             <button className="btn" disabled={busy} onClick={scan}>
-              {busy ? '检测中…' : '🔍 自动检测本机代理'}
+              {busy ? (
+                <>
+                  <IconSpinner />
+                  检测中…
+                </>
+              ) : (
+                <>
+                  <IconSearch />
+                  自动检测本机代理
+                </>
+              )}
             </button>
             {enabled && (
               <button className="btn danger" disabled={busy} onClick={turnOff}>
@@ -360,7 +428,7 @@ function BypassControl() {
             : '没有域名被自动直通，全部正常解密'
         }
       >
-        <span>🛡</span>
+        <IconShield />
         <span className="btn-label">自动直通</span>
         {active.length > 0 && <span>{active.length}</span>}
       </button>
@@ -404,6 +472,35 @@ function BypassControl() {
         </div>
       )}
     </div>
+  );
+}
+
+/* ---------------- 退出（打包成 App 后没有终端可 Ctrl+C） ---------------- */
+function QuitControl() {
+  const [busy, setBusy] = useState(false);
+
+  const quit = async () => {
+    if (busy) return;
+    if (!window.confirm('退出 MiniProxy？\n开启中的系统代理会自动恢复为之前的设置。')) return;
+    setBusy(true);
+    try {
+      await quitApp();
+    } catch {
+      // 进程退出时连接会被掐断，这里的报错不用理会
+    }
+    setBusy(false);
+  };
+
+  return (
+    <button
+      className="btn ghost danger"
+      disabled={busy}
+      onClick={quit}
+      title="结束 MiniProxy 进程（自动恢复系统代理）"
+    >
+      {busy ? <IconSpinner /> : <IconPower />}
+      <span className="btn-label">{busy ? '退出中…' : '退出'}</span>
+    </button>
   );
 }
 
@@ -485,7 +582,7 @@ function RulesControl() {
             : '设置哪些域名/IP 不经过代理（直连），哪些强制走代理'
         }
       >
-        <span>🚦</span>
+        <IconRoute />
         <span className="btn-label">{nDirect || nProxied ? '分流' : '分流规则'}</span>
         {nDirect || nProxied ? <span>{nDirect}/{nProxied}</span> : null}
       </button>
@@ -615,7 +712,7 @@ function MultiSelect({
         title={selected.length ? selected.map((v) => shortOf(options, v)).join(', ') : label}
       >
         <span className="ms-text">{summary}</span>
-        <span className="ms-caret">▾</span>
+        <span className="ms-caret"><IconChevronDown size={10} /></span>
       </button>
       {open && (
         <div className="ms-panel" style={{ width: panelWidth }}>
@@ -642,7 +739,7 @@ function MultiSelect({
                       setOpen(false);
                     }}
                   >
-                    <span className="ms-check">{on ? '✓' : ''}</span>
+                    <span className="ms-check">{on ? <IconCheck size={11} /> : ''}</span>
                     <span className="ms-item-label" title={o.label}>{o.label}</span>
                     {o.count != null && <span className="ms-item-count">{o.count}</span>}
                   </button>
@@ -1052,7 +1149,7 @@ export default function App() {
     setDetailPct(0.44);
   }, []);
 
-  /* ---------------- 窄屏顶栏「☰ 更多」抽屉 ---------------- */
+  /* ---------------- 窄屏顶栏「更多」抽屉 ---------------- */
   const actionsRef = useRef<HTMLDivElement>(null);
   const menuBtnRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1123,55 +1220,62 @@ export default function App() {
               {pendingCount} 条新记录，点击加载
             </button>
           )}
-          <button
-            className={`btn ghost${paused ? ' soft' : ''}`}
-            onClick={() => (paused ? resume() : setPaused(true))}
-            title={paused ? '继续接收新记录' : '暂停刷新列表（抓包仍在继续）'}
-          >
-            <span>{paused ? '▶' : '⏸'}</span>
-            <span className="btn-label">{paused ? '恢复' : '暂停'}</span>
-          </button>
-          <button className="btn ghost danger" onClick={onClear} title="清空当前所有抓包记录">
-            <span>🗑</span>
-            <span className="btn-label">清空</span>
-          </button>
-          <button className="btn ghost" onClick={openVideos} title="列出抓到的完整视频，点击即可下载">
-            <span>🎬</span>
-            <span className="btn-label">视频</span>
-          </button>
-          <span className="header-sep" />
-          {sysProxy?.supported && (
+          <div className="btn-group">
             <button
-              className={`btn ${sysProxy.active ? 'primary' : 'ghost'}`}
-              disabled={sysBusy}
-              onClick={toggleSysProxy}
-              title={
-                sysProxy.active
-                  ? '点击关闭系统代理并恢复直连'
-                  : `一键把系统 HTTP/HTTPS 代理指向 127.0.0.1:${sysProxy.port}`
-              }
+              className={`btn ghost${paused ? ' soft' : ''}`}
+              onClick={() => (paused ? resume() : setPaused(true))}
+              title={paused ? '继续接收新记录' : '暂停刷新列表（抓包仍在继续）'}
             >
-              {sysProxy.active ? (
-                <>
-                  <span>🌐</span>
-                  <span className="btn-label">系统代理</span>
-                  <span>已开启</span>
-                </>
-              ) : (
-                <>
-                  <span>🌐</span>
-                  <span className="btn-label">系统代理</span>
-                  <span>已关闭</span>
-                </>
-              )}
+              {paused ? <IconPlay /> : <IconPause />}
+              <span className="btn-label">{paused ? '恢复' : '暂停'}</span>
             </button>
-          )}
-          <UpstreamControl />
-          <RulesControl />
-          <BypassControl />
+            <button className="btn ghost danger" onClick={onClear} title="清空当前所有抓包记录">
+              <IconTrash />
+              <span className="btn-label">清空</span>
+            </button>
+            <button className="btn ghost" onClick={openVideos} title="列出抓到的完整视频，点击即可下载">
+              <IconClapperboard />
+              <span className="btn-label">视频</span>
+            </button>
+          </div>
           <span className="header-sep" />
-          <ExportMenu query={exportQuery} />
-          <ThemeToggle />
+          <div className="btn-group">
+            {sysProxy?.supported && (
+              <button
+                className={`btn ${sysProxy.active ? 'primary' : 'ghost'}`}
+                disabled={sysBusy}
+                onClick={toggleSysProxy}
+                title={
+                  sysProxy.active
+                    ? '点击关闭系统代理并恢复直连'
+                    : `一键把系统 HTTP/HTTPS 代理指向 127.0.0.1:${sysProxy.port}`
+                }
+              >
+                {sysProxy.active ? (
+                  <>
+                    <IconGlobe />
+                    <span className="btn-label">系统代理</span>
+                    <span>已开启</span>
+                  </>
+                ) : (
+                  <>
+                    <IconGlobe />
+                    <span className="btn-label">系统代理</span>
+                    <span>已关闭</span>
+                  </>
+                )}
+              </button>
+            )}
+            <UpstreamControl />
+            <RulesControl />
+            <BypassControl />
+          </div>
+          <span className="header-sep" />
+          <div className="btn-group">
+            <QuitControl />
+            <ExportMenu query={exportQuery} />
+            <ThemeToggle />
+          </div>
         </div>
         <button
           type="button"
@@ -1182,27 +1286,14 @@ export default function App() {
           aria-expanded={menuOpen}
           title="更多操作"
         >
-          ☰
+          <IconMenu size={17} />
           {pendingCount > 0 && <span className="menu-badge">{pendingCount}</span>}
         </button>
       </header>
 
       <div className="toolbar">
         <div className={`search-wrap${qInput ? ' has-value' : ''}`}>
-          <svg
-            className="search-icon"
-            width="13"
-            height="13"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.4"
-            strokeLinecap="round"
-            aria-hidden="true"
-          >
-            <circle cx="11" cy="11" r="7" />
-            <path d="M21 21l-4.5-4.5" />
-          </svg>
+          <IconSearch size={13} strokeWidth={2.4} className="search-icon" />
           <input
             type="text"
             className="search"
@@ -1216,7 +1307,7 @@ export default function App() {
           />
           {qInput && (
             <button type="button" className="search-clear" title="清空搜索" onClick={() => setQInput('')}>
-              ×
+              <IconX size={12} />
             </button>
           )}
         </div>
@@ -1227,11 +1318,15 @@ export default function App() {
           aria-expanded={filtersOpen}
           title="展开/收起筛选条件"
         >
-          ⚙ 筛选
+          <IconSliders />
+          <span>筛选</span>
           {activeFilterCount > 0 && <span className="ft-count">{activeFilterCount}</span>}
-          <span className="ms-caret">{filtersOpen ? '▴' : '▾'}</span>
+          <span className="ms-caret">
+            {filtersOpen ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
+          </span>
         </button>
         <div className={`toolbar-filters${filtersOpen ? ' open' : ''}`}>
+          <div className="filter-bar">
           <MultiSelect
             label="全部协议"
             options={kindOptions}
@@ -1284,10 +1379,11 @@ export default function App() {
           options={appOptions}
           selected={filters.apps}
           onChange={(v) => setFilters({ ...filters, apps: v })}
-          width={132}
-          panelWidth={250}
-          searchable
-        />
+            width={132}
+            panelWidth={250}
+            searchable
+          />
+          </div>
         </div>
         <div className="toolbar-right">
           <div className="divider" />
@@ -1315,7 +1411,7 @@ export default function App() {
                 title="移除该条件"
                 onClick={() => removeChip(c.key, c.value)}
               >
-                ×
+                <IconX size={11} />
               </button>
             </span>
           ))}
@@ -1336,14 +1432,20 @@ export default function App() {
         <div className="lan-banner">
           <div className="lan-bar">
             <span className="lan-hint">
+              <IconSmartphone size="1em" />{' '}
               {lanDeviceIp
-                ? `📱 检测到局域网设备 ${lanDeviceIp} 正在使用代理`
-                : '📱 想用手机 / 局域网设备抓包？让手机代理指向本机即可，首次使用需安装 CA 证书'}
+                ? `检测到局域网设备 ${lanDeviceIp} 正在使用代理`
+                : '想用手机 / 局域网设备抓包？让手机代理指向本机即可，首次使用需安装 CA 证书'}
             </span>
             {info?.lanIp && (
               <CopyButton
                 text={`${info.lanIp}:${info.proxyPort}`}
-                label={`📶 代理 ${info.lanIp}:${info.proxyPort}`}
+                label={
+                  <>
+                    <IconWifi size={13} />
+                    代理 {info.lanIp}:{info.proxyPort}
+                  </>
+                }
                 title="点击复制手机 Wi-Fi 代理要填的地址"
               />
             )}
@@ -1353,10 +1455,18 @@ export default function App() {
               onClick={() => setLanHelpOpen((o) => !o)}
               title="展开/收起手机抓包证书配置帮助"
             >
-              {lanHelpOpen ? '收起帮助 ▴' : '证书配置帮助 ▾'}
+              {lanHelpOpen ? (
+                <>
+                  收起帮助 <IconChevronUp size={11} />
+                </>
+              ) : (
+                <>
+                  证书配置帮助 <IconChevronDown size={11} />
+                </>
+              )}
             </button>
             <button type="button" className="lan-close" title="不再提示" onClick={() => setLanDismissed(true)}>
-              ×
+              <IconX size={13} />
             </button>
           </div>
           {lanHelpOpen && (
@@ -1429,7 +1539,7 @@ export default function App() {
           <div className="list-scroll">
             {entries.length === 0 ? (
               <div className="empty-state">
-                <div style={{ fontSize: 32 }}>📡</div>
+                <IconRadar size={34} className="empty-icon" />
                 <div>暂无抓包数据</div>
                 <div>
                   将代理设置为 <code>http://127.0.0.1:34567</code> 或点击右上角「系统代理」一键开启，
@@ -1458,7 +1568,9 @@ export default function App() {
                         })
                       }
                     >
-                      <span className="gh-caret">{isCollapsed ? '▸' : '▾'}</span>
+                      <span className="gh-caret">
+                        {isCollapsed ? <IconChevronRight size={11} /> : <IconChevronDown size={11} />}
+                      </span>
                       <span className="gh-label" title={label}>{label}</span>
                       <span className="cnt">{items.length}</span>
                       {canFilter && (
@@ -1471,7 +1583,14 @@ export default function App() {
                             toggleGroupFilter(key);
                           }}
                         >
-                          {on ? '✓ 已筛选' : '只看此组'}
+                          {on ? (
+                            <>
+                              <IconCheck size={10} />
+                              已筛选
+                            </>
+                          ) : (
+                            '只看此组'
+                          )}
                         </button>
                       )}
                     </div>
@@ -1504,13 +1623,13 @@ export default function App() {
                 title="关闭详情面板（Esc）"
                 onClick={() => setPanelOpen(false)}
               >
-                ×
+                <IconX size={14} />
               </button>
               {detail ? (
                 <Detail detail={detail} tab={tab} setTab={setTab} />
               ) : (
                 <div className="empty-state">
-                  <div style={{ fontSize: 28 }}>⏳</div>
+                  <IconSpinner size={28} className="empty-icon" />
                   <div>正在加载详情…</div>
                 </div>
               )}
@@ -1523,22 +1642,41 @@ export default function App() {
         <div className="modal-mask" onClick={() => setVideoOpen(false)}>
           <div className="video-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="视频下载器">
             <div className="video-modal-head">
-              <span className="sub-title" style={{ margin: 0 }}>🎬 视频下载</span>
+              <span
+                className="sub-title"
+                style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+              >
+                <IconClapperboard size={13} />
+                视频下载
+              </span>
               <span className="video-hint">
                 来自本次抓包 · YouTube 走 SABR 私有协议（拿不到直链），下载时会自动补拉缺失的分段
               </span>
               <div className="spacer" />
-              <button type="button" className="btn" onClick={loadVideos}>↻ 刷新</button>
-              <button type="button" className="btn" onClick={() => setVideoOpen(false)}>×</button>
+              <button type="button" className="btn" onClick={loadVideos}>
+                <IconRefresh />
+                刷新
+              </button>
+              <button type="button" className="btn" onClick={() => setVideoOpen(false)} title="关闭">
+                <IconX size={14} />
+              </button>
             </div>
             <div className="video-modal-body">
-              {videoErr && <div className="empty-state"><div style={{ fontSize: 28 }}>⚠️</div><div>{videoErr}</div></div>}
+              {videoErr && (
+                <div className="empty-state">
+                  <IconAlertTriangle size={28} className="empty-icon" />
+                  <div>{videoErr}</div>
+                </div>
+              )}
               {!videoErr && videos === null && (
-                <div className="empty-state"><div style={{ fontSize: 28 }}>⏳</div><div>正在扫描抓包记录…</div></div>
+                <div className="empty-state">
+                  <IconSpinner size={28} className="empty-icon" />
+                  <div>正在扫描抓包记录…</div>
+                </div>
               )}
               {!videoErr && videos !== null && videos.length === 0 && (
                 <div className="empty-state">
-                  <div style={{ fontSize: 32 }}>🎬</div>
+                  <IconClapperboard size={34} className="empty-icon" />
                   <div>还没抓到可下载的完整视频</div>
                   <div>播放一次视频（直播除外）让分段被抓全，再点「刷新」</div>
                   <div className="sabr-gap" style={{ marginTop: 6 }}>
@@ -1603,7 +1741,8 @@ export default function App() {
                                 : '从源站重新拉取完整视频'
                         }
                       >
-                        ⬇ 下载
+                        <IconDownload />
+                        下载
                       </a>
                     </div>
                   ))}
@@ -1743,12 +1882,13 @@ type BodyViewMode = 'text' | 'hex' | 'base64' | 'preview';
 function CopyButton({
   text,
   disabled,
-  label = '复制',
+  label,
   title,
 }: {
   text: string;
   disabled?: boolean;
-  label?: string;
+  /** 按钮文案，可传 JSX 以带图标；不传时用内置的「复制」样式 */
+  label?: React.ReactNode;
   title?: string;
 }) {
   const [copied, setCopied] = useState(false);
@@ -1769,7 +1909,19 @@ function CopyButton({
         }
       }}
     >
-      {copied ? '已复制' : label}
+      {copied ? (
+        <>
+          <IconCheck size={12} />
+          已复制
+        </>
+      ) : (
+        label ?? (
+          <>
+            <IconCopy size={12} />
+            复制
+          </>
+        )
+      )}
     </button>
   );
 }
@@ -1983,6 +2135,12 @@ function BodyView({
             disabled={!downloadable}
             title="下载原始字节（视图被截断时自动拉取完整正文）"
             onClick={async () => {
+              if (entryId != null) {
+                // 走标准 http 下载：后端 dl=1 会带上 attachment 头，浏览器和 App 外壳
+                // 都能落盘；blob + <a download> 在 App 的 WKWebView 里不可靠
+                window.location.href = `/api/entries/${entryId}/body?side=${side}&dl=1`;
+                return;
+              }
               let b = full;
               if (!b && entryId != null && raw?.truncated) {
                 const r = await fetchEntryBody(entryId, side);
@@ -2101,7 +2259,16 @@ function Detail({
       <div className="detail-head">
         <div className="url">
           {kind === 'http' && <MethodBadge method={detail.method} />} {detail.url}
-          <CopyButton text={detail.url} label="⧉ 复制 URL" title="复制完整 URL" />
+          <CopyButton
+            text={detail.url}
+            label={
+              <>
+                <IconCopy size={12} />
+                复制 URL
+              </>
+            }
+            title="复制完整 URL"
+          />
         </div>
         <div className="meta">
           {detail.status != null && (
