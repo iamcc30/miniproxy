@@ -52,6 +52,8 @@ pub struct App {
     pub outbound_tls_failures: std::sync::Mutex<std::collections::HashMap<String, (u32, u128)>>,
     /// 出站分流规则：哪些域名/IP 跳过代理（直连）、哪些强制走代理。界面可改、持久化。
     pub rules: rules::SharedRules,
+    /// 界面「退出」按钮（POST /api/quit）触发的优雅停机信号。
+    pub quit_tx: tokio::sync::mpsc::Sender<()>,
 }
 
 impl App {
@@ -287,6 +289,24 @@ async fn main() {
     }
     println!("==============================================");
 
+    // 上次运行没正常收尾（被强杀、看门狗也没活下来、enable 中途失败）时，备份文件会留下，
+    // 系统代理可能仍指向已经停掉的端口 —— 表现就是"莫名断网"。这里自愈，或至少说清楚。
+    //
+    // 没有备份就说明本进程从未接管过系统代理。启动**不会**自动接管（那是界面右上角
+    // 「🌐 系统代理」的手动动作，对应 POST /api/system-proxy/enable），这里明说一句，
+    // 免得把"服务启动"误当成"系统代理已生效"。
+    match sysproxy::check_stale_backup(proxy_port) {
+        Some(msg) => println!("  系统代理自检  : {}", msg),
+        None => println!(
+            "  系统代理      : 未接管（启动不会自动开启，需在界面右上角「🌐 系统代理」手动开启）"
+        ),
+    }
+
+    // 界面退出按钮的信号通道。打包成 .app 后没有终端可按 Ctrl+C，
+    // Dock 的「退出」对非 Cocoa 程序常常只能强杀（SIGKILL），跳过优雅收尾；
+    // 界面里点「退出」走这条通道，能正常恢复系统代理。
+    let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let app = Arc::new(App {
         store,
         ca,
@@ -299,6 +319,7 @@ async fn main() {
         bypass_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
         outbound_tls_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         rules,
+        quit_tx: quit_tx.clone(),
     });
 
     if !rules_cfg.direct.is_empty() || !rules_cfg.proxied.is_empty() {
@@ -310,8 +331,11 @@ async fn main() {
         println!("==============================================");
     }
 
+    // 关停广播：收到退出信号后让两个 server 停止接受新连接、给在途请求留一点收尾时间
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
+
     // API + 静态界面服务
-    {
+    let api_server = {
         let app = app.clone();
         let ip = if api_host == "0.0.0.0" || api_host.is_empty() {
             [0, 0, 0, 0]
@@ -332,47 +356,76 @@ async fn main() {
                 }))
             }
         });
-        tokio::spawn(async move {
-            if let Err(e) = hyper::Server::bind(&addr).serve(make_svc).await {
-                eprintln!("API 服务启动失败: {}", e);
+        // 必须用 try_bind：Server::bind 在端口被占用时是 panic 而不是返回 Err，
+        // 而它又跑在 spawn 的任务里 —— panic 只会让那个任务静默死掉、主进程继续
+        // 挂在信号等待上，于是留下一个"没有任何监听端口"的幽灵进程（实测踩到过）。
+        let server = match hyper::Server::try_bind(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("API 服务启动失败（{} 可能已被占用）: {}", addr, e);
                 std::process::exit(1);
             }
-        });
-    }
+        };
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = server
+                .serve(make_svc)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.recv().await;
+                })
+                .await
+            {
+                eprintln!("API 服务异常退出: {}", e);
+            }
+        })
+    };
 
     // 代理服务（放入后台任务，主任务等待退出信号）
-    let app2 = app.clone();
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], proxy_port));
-    let make_svc = hyper::service::make_service_fn(move |conn: &AddrStream| {
-        let app = app2.clone();
-        let peer_ip = conn.remote_addr().ip().to_string();
-        // 仅本机连接反查进程（远端设备的端口在 lsof 里查不到，跳过省时）
-        let local = matches!(peer_ip.as_str(), "127.0.0.1" | "::1");
-        let peer_port = conn.remote_addr().port();
-        async move {
-            let name = if local {
-                tokio::task::spawn_blocking(move || attrib::process_for_port(peer_port))
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-            let info = capture::ClientInfo { name, ip: peer_ip };
-            Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |req| {
-                proxy::handle_proxy(req, app.clone(), info.clone())
-            }))
-        }
-    });
-
-    {
-        tokio::spawn(async move {
-            if let Err(e) = hyper::Server::bind(&addr).serve(make_svc).await {
-                eprintln!("代理服务启动失败: {}", e);
-                std::process::exit(1);
+    let proxy_server = {
+        let app2 = app.clone();
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], proxy_port));
+        let make_svc = hyper::service::make_service_fn(move |conn: &AddrStream| {
+            let app = app2.clone();
+            let peer_ip = conn.remote_addr().ip().to_string();
+            // 仅本机连接反查进程（远端设备的端口在 lsof 里查不到，跳过省时）
+            let local = matches!(peer_ip.as_str(), "127.0.0.1" | "::1");
+            let peer_port = conn.remote_addr().port();
+            async move {
+                let name = if local {
+                    tokio::task::spawn_blocking(move || attrib::process_for_port(peer_port))
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let info = capture::ClientInfo { name, ip: peer_ip };
+                Ok::<_, std::convert::Infallible>(hyper::service::service_fn(move |req| {
+                    proxy::handle_proxy(req, app.clone(), info.clone())
+                }))
             }
         });
-    }
+        // 同 API 服务：用 try_bind，端口占用时立刻退出而不是留下幽灵进程
+        let server = match hyper::Server::try_bind(&addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("代理服务启动失败（{} 可能已被占用）: {}", addr, e);
+                std::process::exit(1);
+            }
+        };
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = server
+                .serve(make_svc)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.recv().await;
+                })
+                .await
+            {
+                eprintln!("代理服务异常退出: {}", e);
+            }
+        })
+    };
 
     // 从未配置过上游时：后台探测本机常见代理端口（Clash/Charles/Surge/v2ray…），
     // 探测到即自动启用。放后台任务里做，避免拖慢启动、也不阻塞端口监听。
@@ -400,9 +453,25 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {},
         _ = term.recv() => {},
         _ = hup.recv() => {},
+        _ = quit_rx.recv() => { println!("收到界面退出请求"); },
     }
 
     println!("\n收到退出信号，正在清理…");
+
+    // 先让两个 server 停止接受新连接，并给在途请求最多 3 秒收尾。
+    // 旧实现收到信号后直接往下走，runtime 一结束在途请求（下载 / ffmpeg 合并）就被硬断。
+    let _ = shutdown_tx.send(());
+    let drain = async {
+        let _ = api_server.await;
+        let _ = proxy_server.await;
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(3), drain)
+        .await
+        .is_err()
+    {
+        println!("  仍有连接在传输（WebSocket / 视频流等长连接不等待），直接结束");
+    }
+
     // 若系统代理由本进程开启，恢复用户原有配置
     if sysproxy::is_on() {
         match sysproxy::disable() {

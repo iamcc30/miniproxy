@@ -68,6 +68,19 @@ pub async fn handle_api(
         (&Method::GET, "/api/health") => {
             json_response(serde_json::json!({"ok": true, "name": "miniproxy"}))
         }
+        // 界面「退出」按钮：优雅停机（恢复系统代理）后退出进程。
+        // 先应答再发信号，否则响应会跟 server 关闭赛跑、前端拿到空响应。
+        (&Method::POST, "/api/quit") => {
+            let tx = app.quit_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let _ = tx.send(()).await;
+            });
+            json_response(serde_json::json!({
+                "ok": true,
+                "hint": "MiniProxy 正在退出，开启中的系统代理会自动恢复",
+            }))
+        }
         (&Method::GET, "/api/info") => json_response(serde_json::json!({
             "name": "miniproxy",
             "apiPort": app.api_port,
@@ -966,6 +979,9 @@ async fn entry_fullmux(req: Request<Body>, app: Arc<App>, path: &str) -> Respons
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        // 请求被中断 / 进程退出时把 ffmpeg 一并带走，否则它会变成孤儿继续
+        // 往临时目录写半个文件（父进程已经不在，没人再清理它）
+        .kill_on_drop(true)
         .status()
         .await;
     match status {
@@ -1287,6 +1303,8 @@ async fn entry_umpsave(app: Arc<App>, path: &str) -> Response<Body> {
                 return json_error(StatusCode::NOT_IMPLEMENTED, "未找到 ffmpeg，无法合并音视频");
             };
             let mut cmd = tokio::process::Command::new(&ffmpeg);
+            // 同 /fullmux：请求中断或进程退出时把 ffmpeg 一起结束，避免留下孤儿进程
+            cmd.kill_on_drop(true);
             cmd.arg("-y").arg("-i").arg(&vfile).arg("-i").arg(af).args(["-c", "copy"]);
             if out_ext == "mp4" {
                 cmd.args(["-movflags", "+faststart"]);
@@ -3272,10 +3290,26 @@ fn static_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("MINIPROXY_STATIC") {
         return std::path::PathBuf::from(d);
     }
+    // 先按「相对可执行文件」找，再按「相对工作目录」找。
+    // 打包成 macOS .app 后从 Finder/Launchpad 双击启动时，进程工作目录是 "/"，
+    // 下面那组 CWD 相对路径会全部落空 → 界面显示"未找到前端界面"。
+    // Bundle 结构：Contents/MacOS/miniproxy → ../Resources/static。
+    // 顺带兼容"二进制与 static/ 平级"的绿色免安装分发形式。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [dir.join("../Resources/static"), dir.join("static")] {
+                if cand.join("index.html").is_file() {
+                    // 规范化掉 `..`：serve_static 的防穿越判断是字符串前缀比较，
+                    // 带 `..` 的 base 会让 `base.join("../../x")` 依然"以 base 开头"。
+                    return std::fs::canonicalize(&cand).unwrap_or(cand);
+                }
+            }
+        }
+    }
     for cand in ["./static", "./frontend/dist", "../frontend/dist"] {
         let p = std::path::PathBuf::from(cand);
         if p.join("index.html").exists() {
-            return p;
+            return std::fs::canonicalize(&p).unwrap_or(p);
         }
     }
     std::path::PathBuf::from("./static")
@@ -3285,7 +3319,12 @@ async fn serve_static(path: &str) -> Response<Body> {
     let base = static_dir();
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    // 防目录穿越
+    // 防目录穿越。只比字符串前缀不够：内核会解析 `..`，`base.join("../../etc/passwd")`
+    // 拼出来仍然"以 base 开头"，却能读到 base 外面去（`GET /../../../etc/passwd`）。
+    // 这里直接拒绝任何含 `..` 或 NUL 的路径段。
+    if rel.split('/').any(|seg| seg == ".." || seg.contains('\0')) {
+        return not_found();
+    }
     let full = base.join(rel);
     if !full.starts_with(&base) {
         return not_found();

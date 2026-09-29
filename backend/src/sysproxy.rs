@@ -56,29 +56,33 @@ pub fn is_on() -> bool {
     SYS_PROXY_ON.load(Ordering::SeqCst)
 }
 
+/// 取看门狗句柄锁。不用 unwrap：一旦某个线程在持锁时 panic，unwrap 会二次 panic，
+/// 让调用方（disable / 退出清理）半途中断，反而把系统代理留在脏状态。
+fn lock_watchdog() -> std::sync::MutexGuard<'static, Option<std::process::Child>> {
+    match WATCHDOG.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// 孵化看门狗子进程（已存活则跳过）。父进程被强杀后由它负责恢复系统代理。
-fn spawn_watchdog() {
-    let mut g = WATCHDOG.lock().unwrap();
+///
+/// 返回 Err 表示"看门狗没起来" —— 此时强杀本进程不会有人恢复系统代理，
+/// 调用方必须把这件事告诉用户，不能静默降级。
+fn spawn_watchdog() -> Result<(), String> {
+    let mut g = lock_watchdog();
     // 已有存活的看门狗则不重复孵化
     if let Some(child) = g.as_mut() {
         if child.try_wait().map(|st| st.is_none()).unwrap_or(true) {
-            return;
+            return Ok(());
         }
     }
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let exe = std::env::current_exe().map_err(|e| format!("获取自身可执行文件路径失败: {}", e))?;
 
     // 父子各持 socketpair 一端：父进程消失（正常退出 / kill -9 / 崩溃）时，
     // 它持有的那端随之关闭，子进程读到 EOF。相比 ps 轮询，不受命令可用性影响。
-    let (parent_end, child_end) = match std::os::unix::net::UnixStream::pair() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("创建看门狗管道失败: {}", e);
-            return;
-        }
-    };
+    let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| format!("创建看门狗管道失败: {}", e))?;
 
     let child_io = std::process::Stdio::from(std::os::fd::OwnedFd::from(child_end));
     let child = std::process::Command::new(exe)
@@ -95,22 +99,35 @@ fn spawn_watchdog() {
                 *link = Some(parent_end);
             }
             *g = Some(c);
+            Ok(())
         }
-        Err(e) => eprintln!("孵化系统代理看门狗失败: {}", e),
+        Err(e) => Err(format!("孵化看门狗子进程失败: {}", e)),
     }
 }
 
 /// 终止看门狗子进程（正常关闭系统代理或优雅退出时调用）。
+///
+/// 顺序很重要：**必须先 kill 子进程、再关闭父端 socketpair**。
+/// 反过来（旧实现）会给子进程留一个抢跑窗口：它读到 EOF 后也开始执行 disable()，
+/// 于是父子两个进程并发改系统代理 —— 子进程还会把备份文件删掉，
+/// 导致父进程读到 None 走"全部关闭"兜底分支，而不是恢复用户原本的代理设置。
 fn stop_watchdog() {
-    // 先关闭父端：即使 kill 失败，子进程也会因读到 EOF 而自行退出
+    {
+        let mut g = lock_watchdog();
+        if let Some(mut child) = g.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    // 子进程已回收，此时再关父端就不会引发抢跑
     if let Ok(mut link) = WATCHDOG_LINK.lock() {
         *link = None;
     }
-    let mut g = WATCHDOG.lock().unwrap();
-    if let Some(mut child) = g.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+}
+
+/// 系统代理配置是否指向 127.0.0.1:port。
+fn points_to_port(v: &Option<(String, u16)>, port: u16) -> bool {
+    matches!(v, Some((h, p)) if *p == port && (h == "127.0.0.1" || h == "localhost"))
 }
 
 /// 看门狗主循环：阻塞读父进程持有的 socketpair 端，读到 EOF 即父进程消失，按备份恢复后退出。
@@ -285,34 +302,127 @@ pub fn status() -> Result<Vec<ServiceState>, String> {
         .collect())
 }
 
+/// 启动自愈：上一次运行若没有正常收尾（被强杀、看门狗也没活下来、enable 中途失败），
+/// 会留下一份备份文件，而系统代理可能仍然指向那个已经停掉的端口 —— 表现就是"莫名断网"。
+///
+/// 判定与处置：
+/// - 系统代理**没**指向备份里的端口：说明已被手动或其他工具改回，只提示、不动它，
+///   也保留备份文件（可能是别的实例正在用的）。
+/// - 系统代理**仍**指向备份里的端口，且该端口当前空闲（没有别的实例在监听）：
+///   说明属主进程确实已经死了，按备份自动恢复。
+/// - 系统代理指向该端口但端口被占用：有实例正在服务，不动。
+///
+/// 返回给调用方打印的提示文本。
+pub fn check_stale_backup(port: u16) -> Option<String> {
+    let path = backup_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let backup: Backup = match serde_json::from_str(&raw) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return Some(format!(
+                "发现损坏的系统代理备份文件，已删除：{}",
+                path.display()
+            ));
+        }
+    };
+
+    // 备份对不上本实例的端口 → 不是本实例留下的，不处理
+    if backup.port != port {
+        return Some(format!(
+            "发现一份系统代理备份（对应 127.0.0.1:{}，本实例端口 {}），不是本实例留下的，跳过",
+            backup.port, port
+        ));
+    }
+
+    let svcs = match status() {
+        Ok(s) => s,
+        Err(e) => return Some(format!("检查系统代理状态失败: {}", e)),
+    };
+    let pointing: Vec<&ServiceState> = svcs
+        .iter()
+        .filter(|s| points_to_port(&s.http, backup.port) || points_to_port(&s.https, backup.port))
+        .collect();
+
+    if pointing.is_empty() {
+        return Some(format!(
+            "上次运行留下了系统代理备份（记录 {} 个网络服务的原配置），但系统代理当前并未指向 127.0.0.1:{}，可能已被手动或由其他工具改回。为不覆盖你现在的设置，本次不动系统代理（备份文件保留在 {}）",
+            backup.services.len(),
+            backup.port,
+            path.display()
+        ));
+    }
+
+    // 端口还被人监听 → 有实例在服务，本次启动大概率会因为端口占用而退出，别动
+    if std::net::TcpListener::bind(("127.0.0.1", backup.port)).is_err() {
+        return Some(format!(
+            "系统代理仍指向 127.0.0.1:{}，且该端口有进程在监听（可能是另一个 MiniProxy 实例），跳过自动恢复",
+            backup.port
+        ));
+    }
+
+    match disable() {
+        Ok(()) => Some(format!(
+            "上次退出未恢复系统代理（{} 个网络服务仍指向已停止的 127.0.0.1:{}），已按备份自动恢复为开启前的配置",
+            pointing.len(),
+            backup.port
+        )),
+        Err(e) => Some(format!(
+            "上次退出未恢复系统代理，自动恢复失败: {}。请到「系统设置 → 网络 → 代理」手动检查",
+            e
+        )),
+    }
+}
+
 /// 将所有网络服务的 HTTP / HTTPS（及 SOCKS）代理指向 127.0.0.1:port，
 /// 并把 `extra_bypass`（分流规则里「跳过代理」的条目）追加进 bypass 列表。
 /// 开启前备份现有配置（含原 bypass 列表），关闭时原样恢复。
 pub fn enable(port: u16, extra_bypass: &[String]) -> Result<(), String> {
-    let services = status()?;
-    let backup = Backup {
-        port,
-        services: services.clone(),
-    };
     let path = backup_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let services = status()?;
+
+    // 重复点击「开启系统代理」（系统代理已指向本实例）时，绝不能拿现状覆盖备份：
+    // 否则备份里记的是"指向自己"，关闭时会按它恢复成已经失效的端口 → 断网。
+    let existing: Option<Backup> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let already_ours = existing.as_ref().map(|b| b.port == port).unwrap_or(false);
+    // 回滚基准：优先用最早那份备份（真正的"开启前"配置），没有才用现场值
+    let rollback_base: Vec<ServiceState> = match &existing {
+        Some(b) => b.services.clone(),
+        None => services.clone(),
+    };
+
+    if !already_ours {
+        let backup = Backup {
+            port,
+            services: services.clone(),
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&path, serde_json::to_string(&backup).unwrap_or_default())
+            .map_err(|e| format!("写入代理配置备份失败: {}", e))?;
     }
-    std::fs::write(&path, serde_json::to_string(&backup).unwrap_or_default())
-        .map_err(|e| format!("写入代理配置备份失败: {}", e))?;
 
     let port_s = port.to_string();
     let mut errs = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
     for s in list_services()? {
+        let mut svc_ok = true;
         if let Err(e) = run("networksetup", &["-setwebproxy", &s, "127.0.0.1", &port_s]) {
             errs.push(format!("{}: {}", s, e));
-            continue;
+            svc_ok = false;
         }
         if let Err(e) = run("networksetup", &["-setsecurewebproxy", &s, "127.0.0.1", &port_s]) {
             errs.push(format!("{}: {}", s, e));
+            svc_ok = false;
         }
         // SOCKS 失败不视为致命（部分服务不支持）
         let _ = run("networksetup", &["-setsocksfirewallproxy", &s, "127.0.0.1", &port_s]);
+        if svc_ok {
+            changed.push(s.clone());
+        }
 
         // bypass：保留用户原有条目 + 追加分流规则里「跳过代理」的条目
         let mut list = services
@@ -330,12 +440,47 @@ pub fn enable(port: u16, extra_bypass: &[String]) -> Result<(), String> {
             eprintln!("[miniproxy] 设置 {} 的 bypass 列表失败: {}", s, e);
         }
     }
+
     if errs.is_empty() {
         SYS_PROXY_ON.store(true, Ordering::SeqCst);
-        spawn_watchdog();
+        // 看门狗起不来 = 强杀本进程后没人能恢复系统代理，属于静默降级，必须让调用方知道
+        if let Err(e) = spawn_watchdog() {
+            return Err(format!(
+                "系统代理已开启，但{}。如需强杀本进程，请先手动关闭系统代理",
+                e
+            ));
+        }
         Ok(())
+    } else if already_ours {
+        // 只是重复刷新：本次失败不影响上一次已经生效的配置，保持原状即可
+        Err(format!(
+            "系统代理由本实例开启中，本次刷新失败：{}（原配置仍然有效）",
+            errs.join("；")
+        ))
     } else {
-        Err(errs.join("；"))
+        // 部分服务设置失败：把已经改过的服务回滚回开启前的配置。
+        // 否则会留下"一半指向本实例、一半指向别处"的僵状态，
+        // 而且没有 SYS_PROXY_ON 标记，退出时也不会被自动清理。
+        let mut rb_errs = Vec::new();
+        for name in &changed {
+            if let Some(orig) = rollback_base.iter().find(|x| &x.name == name) {
+                restore_service(name, orig.http.clone(), "-setwebproxy", "-setwebproxystate", &mut rb_errs);
+                restore_service(name, orig.https.clone(), "-setsecurewebproxy", "-setsecurewebproxystate", &mut rb_errs);
+                restore_service(name, orig.socks.clone(), "-setsocksfirewallproxy", "-setsocksfirewallproxystate", &mut rb_errs);
+                if let Err(e) = set_bypass(name, &orig.bypass) {
+                    rb_errs.push(format!("{}: {}", name, e));
+                }
+            }
+        }
+        // 已回滚，这份备份不再代表"开启前的配置"，删掉避免下次被误当成有效备份
+        let _ = std::fs::remove_file(&path);
+        let mut msg = format!("开启系统代理失败：{}", errs.join("；"));
+        if rb_errs.is_empty() {
+            msg.push_str(&format!("；已回滚 {} 个网络服务的改动", changed.len()));
+        } else {
+            msg.push_str(&format!("；回滚时又有错误: {}", rb_errs.join("；")));
+        }
+        Err(msg)
     }
 }
 
@@ -361,7 +506,17 @@ pub fn disable() -> Result<(), String> {
                     errs.push(format!("{}: {}", s.name, e));
                 }
             }
-            let _ = std::fs::remove_file(&path);
+            // 只有全部恢复成功才删备份：否则一旦出错就再也没有"原值"可重试，
+            // 用户手动改回去也无从对照，只能自己回忆。
+            if errs.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                eprintln!(
+                    "[miniproxy] 恢复系统代理有 {} 处失败，已保留备份 {} 便于重试",
+                    errs.len(),
+                    path.display()
+                );
+            }
         }
         None => {
             for s in list_services()? {
